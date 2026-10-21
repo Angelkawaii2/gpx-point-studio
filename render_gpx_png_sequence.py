@@ -209,7 +209,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             length=int(self.headers.get('Content-Length',0))
-            if length>30*1024*1024: raise ValueError('文件不能超过 30 MB')
             raw=self.rfile.read(length)
             if self.path=='/api/import':
                 track=parse_gpx(raw); key=uuid.uuid4().hex; tracks[key]=track
