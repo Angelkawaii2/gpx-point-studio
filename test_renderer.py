@@ -249,6 +249,39 @@ class RendererTests(unittest.TestCase):
         self.assertNotEqual(roads.tobytes(),pois.tobytes())
         with self.assertRaises(ValueError):label_options(dict(label_language='unknown-language'))
 
+    def test_target_video_duration_sets_exact_frame_count(self):
+        track=dict(points=[dict(offset=0),dict(offset=18000)])
+        plan=renderer.export_plan(track,dict(target_duration=3600,fps=30,export_speed=10),0,1)
+        self.assertEqual(plan['frame_count'],108000)
+        self.assertEqual(plan['export_speed'],5)
+        self.assertEqual(plan['sequence_duration'],3600)
+        self.assertEqual(plan['point_conflicts'],0)
+
+    def test_original_points_use_nearest_frames_without_stretching(self):
+        points=[dict(offset=t) for t in [0,1,2,3,6,7]]
+        plan=renderer.export_plan(dict(points=points),dict(target_duration=7,fps=25),0,5)
+        assignments,_=renderer.point_frame_assignments(points,plan)
+        self.assertEqual(plan['frame_count'],175)
+        self.assertEqual(set(assignments.values()),set(range(6)))
+        for frame,index in assignments.items():
+            self.assertLessEqual(abs(renderer.frame_offset(plan,0,frame)-points[index]['offset']),7/174/2+1e-9)
+
+    def test_dense_point_conflicts_do_not_add_frames(self):
+        track=dict(points=[dict(offset=i) for i in range(100)])
+        plan=renderer.export_plan(track,dict(target_duration=1,fps=25),0,99)
+        self.assertEqual(plan['frame_count'],25)
+        self.assertEqual(plan['point_conflicts'],75)
+        self.assertEqual(plan['preserved_points'],25)
+        self.assertEqual(plan['sequence_duration'],1)
+
+    def test_target_duration_rounds_to_closest_frame(self):
+        track=dict(points=[dict(offset=0),dict(offset=10)])
+        plan=renderer.export_plan(track,dict(target_duration=1.01,fps=25),0,1)
+        self.assertEqual(plan['frame_count'],25)
+        self.assertLessEqual(abs(plan['duration_error']),.5/25)
+        for value in [0,-1,float('nan')]:
+            with self.assertRaises(ValueError):renderer.export_plan(track,dict(target_duration=value),0,1)
+
     def test_reject_invalid_coordinates(self):
         with self.assertRaises(ValueError):
             renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="nan" lon="2"/></trkseg></trk></gpx>')

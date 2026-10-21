@@ -376,19 +376,46 @@ def interpolate_position(points, offset, offsets=None, fit_gaps=False):
                 lon=(a['lon']+delta_lon*ratio+180)%360-180,offset=offset)
 
 
+def point_frame_assignments(points, plan):
+    assignments={};total=0;times=[]
+    duration=plan['source_duration'];n=plan['frame_count']
+    for i,p in enumerate(points):
+        if not plan['source_start']<=p['offset']<=plan['source_end']:continue
+        total+=1;times.append(p['offset'])
+        frame=min(n-1,max(0,math.floor((p['offset']-plan['source_start'])/duration*(n-1)+.5))) if duration else 0
+        error=abs(p['offset']-frame_offset(plan,plan['source_start'],frame))
+        if frame not in assignments or error<assignments[frame][0]:assignments[frame]=(error,i)
+    intervals=[b-a for a,b in zip(times,times[1:]) if b>a]
+    minimum=min(intervals) if intervals else None
+    diagnostics=dict(source_points=total,preserved_points=len(assignments),point_conflicts=total-len(assignments),
+        duplicate_timestamp_points=sum(a==b for a,b in zip(times,times[1:])),
+        suggested_fps=math.ceil((duration/minimum+1)/plan['estimated_duration']) if minimum else None)
+    return {frame:value[1] for frame,value in assignments.items()},diagnostics
+
+
 def export_plan(track, config, start, end):
-    speed = float(config.get('export_speed',10))
-    fps_value = float(config.get('fps',30))
-    if not math.isfinite(speed) or not 1<=speed<=100 or fps_value not in (25,30,50,60):
-        raise ValueError('导出倍率必须为 1–100，帧率须为 25、30、50、60')
+    speed=float(config.get('export_speed',10));fps_value=float(config.get('fps',30))
+    if fps_value not in (25,30,50,60):raise ValueError('帧率须为 25、30、50、60')
     first=float(config.get('start_offset',track['points'][start]['offset']))
     last=float(config.get('end_offset',track['points'][end]['offset']))
     if not math.isfinite(first+last) or not track['points'][0]['offset']<=first<=last<=track['points'][-1]['offset']:
         raise ValueError('时间区间无效')
-    duration = last-first
-    count = max(1,math.ceil(duration/speed*int(fps_value)))
-    return dict(export_speed=speed,fps=int(fps_value),source_start=first,source_end=last,source_duration=duration,
-                estimated_duration=duration/speed,frame_count=count,sequence_duration=count/int(fps_value))
+    duration=last-first
+    if 'target_duration' in config:
+        target=float(config['target_duration'])
+        if not math.isfinite(target) or target<=0:raise ValueError('目标视频时长必须大于零')
+        speed=duration/target
+    else:
+        if not math.isfinite(speed) or not 1<=speed<=100:raise ValueError('导出倍率必须为 1–100')
+        target=duration/speed
+    count=max(1,math.floor(target*int(fps_value)+.5))
+    plan=dict(export_speed=speed,fps=int(fps_value),source_start=first,source_end=last,source_duration=duration,
+              estimated_duration=target,frame_count=count,sequence_duration=count/int(fps_value),
+              effective_speed=duration/(count/int(fps_value)),duration_error=count/int(fps_value)-target,
+              policy='target-duration-priority')
+    _,diagnostics=point_frame_assignments(track['points'],plan)
+    plan.update(diagnostics)
+    return plan
 
 
 def frame_offset(plan, first_offset, frame):
@@ -461,11 +488,13 @@ def export_job(job, track, config, start, end):
         plan = export_plan(track,config,start,end)
         points = track['points']
         offsets = [p['offset'] for p in points]
+        assignments,_=point_frame_assignments(points,plan)
         folder=ROOT/'.exports'; folder.mkdir(exist_ok=True)
         path=folder/f'{job}.zip'
         with zipfile.ZipFile(path,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as archive:
             jobs[job].update(rendered=0,reused=0)
-            positions = (interpolate_position(points,frame_offset(plan,plan['source_start'],frame),offsets,
+            positions = (points[assignments[frame]] if frame in assignments else
+                         interpolate_position(points,frame_offset(plan,plan['source_start'],frame),offsets,
                          fit_gaps=bool(config.get('fit_gaps',False))) for frame in range(plan['frame_count']))
             for frame,(png,reused) in enumerate(render_sequence(points,positions,config,api_key)):
                 archive.writestr(f'frame_{frame+1:06d}.png',png)
@@ -473,7 +502,8 @@ def export_job(job, track, config, start, end):
                 jobs[job]['done']=frame+1
             jobs[job]['phase']='packing'
             archive.writestr('manifest.json',json.dumps(dict(settings=config,start=start,end=end,
-                timing=plan,rendering=dict(rendered=jobs[job]['rendered'],reused=jobs[job]['reused']),timed=track['timed'],sampling='uniform source-time interpolation including endpoints',
+                timing=plan,rendering=dict(rendered=jobs[job]['rendered'],reused=jobs[job]['reused']),timed=track['timed'],sampling='fixed frame grid with original points assigned to nearest frames; conflicts keep the closest point',
+                point_frames=[dict(frame=frame+1,source_point=index) for frame,index in sorted(assignments.items())],
                 points=points[start:end+1]),ensure_ascii=False))
         jobs[job].update(status='complete',phase='complete',path=str(path))
     except Exception as exc:
