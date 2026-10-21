@@ -23,6 +23,7 @@ cp .env.example .env
 
 - 点击导入或将一个 `.gpx` 文件拖到页面任意位置（不设文件大小上限）；自动显示全部轨迹点，支持多个轨迹段及路线点。
 - 点击轨迹点、点击地图选最近点，或拖动定位标记沿轨迹选点；原始坐标不会改变。
+- 时间轴起点、终点、当前时间及刻度下方显示录制当地时间：优先使用 GPX 时间戳记录的 UTC 偏移（`Z` 表示 UTC），没有偏移时使用浏览器时区。无时区时间戳也按浏览器时区解析。
 - 时间轴首尾控制裁剪范围，蓝色游标控制当前点；左右箭头逐点移动。
 - 时间轴支持 1–32 倍缩放：使用加减按钮或滚轮，以鼠标位置为中心缩放；使用水平滚动条、触控板或 Shift + 滚轮平移。“显示完整时间轴”恢复全览。聚焦时间轴后可用 `+`、`-`、`0` 操作。
 - 选择默认 OSM、CARTO Dark 或 Light 样式；支持地图缩放等级 1–19、宽高各 128–4096 像素。PNG 预览与导出共用同一后端渲染器。
@@ -81,6 +82,7 @@ The app opens <http://127.0.0.1:8765> automatically. Use `--port 9000` to change
 
 - Import one `.gpx` file using the picker or drop it anywhere on the page (no application-defined file size limit). The map fits all points and preserves separate track segments and routes.
 - Select a point directly, click the map to select its nearest point, or drag the location marker along the track. Original coordinates remain unchanged.
+- A second row below timeline endpoints, the current time, and ruler ticks shows recording time in the GPX timestamp’s UTC offset (`Z` means UTC), falling back to the browser timezone when absent. Naive timestamps are parsed using the browser timezone as well.
 - Trim with the timeline's start/end handles and seek with the blue playhead. Arrow buttons step through original points.
 - Zoom the timeline from 1× to 32× using its buttons or the mouse wheel. Wheel zoom anchors at the pointer. Pan with the horizontal scrollbar, a trackpad, or Shift + wheel. Reset with “显示完整时间轴”. When the timeline is focused, `+`, `-`, and `0` provide keyboard controls.
 - Choose OpenStreetMap, CARTO Dark, or CARTO Light; configure map zoom 1–19 and output width/height of 128–4096 pixels. Preview and export use the same backend renderer.

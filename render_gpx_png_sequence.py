@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_right
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -88,7 +89,8 @@ def tile_url(style, z, x, y, api_key=_KEY_DEFAULT):
         url += '?' + urlencode({'key': api_key})
     return url
 
-def parse_gpx(data):
+def parse_gpx(data, browser_timezone=None):
+    fallback_zone = ZoneInfo(browser_timezone) if browser_timezone else None
     root = ET.fromstring(data)
     points = []
     segment = 0
@@ -102,8 +104,16 @@ def parse_gpx(data):
             if not math.isfinite(lat + lon) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
                 raise ValueError('GPX 包含无效经纬度')
             stamp = next((c.text for c in node if c.tag.split('}')[-1] == 'time'), None)
-            ts = datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() if stamp else None
-            points.append(dict(lat=lat, lon=lon, time=stamp, timestamp=ts, segment=segment))
+            ts, recorded_offset = None, None
+            if stamp:
+                parsed = datetime.fromisoformat(stamp.strip().replace('Z', '+00:00'))
+                if parsed.tzinfo is not None:
+                    recorded_offset = int(parsed.utcoffset().total_seconds()/60)
+                elif fallback_zone is not None:
+                    parsed = parsed.replace(tzinfo=fallback_zone)
+                ts = parsed.timestamp()
+            points.append(dict(lat=lat, lon=lon, time=stamp, timestamp=ts, segment=segment,
+                               recorded_offset_minutes=recorded_offset))
         segment += 1
     if not points:
         raise ValueError('GPX 中没有轨迹点')
@@ -373,7 +383,7 @@ class Handler(BaseHTTPRequestHandler):
             length=int(self.headers.get('Content-Length',0))
             raw=self.rfile.read(length)
             if self.path=='/api/import':
-                track=parse_gpx(raw); key=uuid.uuid4().hex; tracks[key]=track
+                track=parse_gpx(raw,self.headers.get('X-Browser-Time-Zone')); key=uuid.uuid4().hex; tracks[key]=track
                 self.send(dict(id=key,**track)); return
             data=json.loads(raw)
             if self.path == '/api/config':

@@ -135,6 +135,19 @@ class RendererTests(unittest.TestCase):
             plan=renderer.export_plan(track,dict(fps=fps,export_speed=5),0,1)
             self.assertEqual(plan['frame_count'],2*fps)
 
+    def test_recorded_timezone_offset_is_preserved(self):
+        track=renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="1" lon="2"><time>2026-01-01T09:30:00+09:30</time></trkpt></trkseg></trk></gpx>','Asia/Singapore')
+        point=track['points'][0]
+        self.assertEqual(point['recorded_offset_minutes'],570)
+        self.assertEqual(point['timestamp'],1767225600)
+
+    def test_timezone_missing_uses_browser_zone(self):
+        data=b'<gpx><trk><trkseg><trkpt lat="1" lon="2"><time>2026-01-01T09:00:00</time></trkpt></trkseg></trk></gpx>'
+        tokyo=renderer.parse_gpx(data,'Asia/Tokyo')['points'][0]
+        utc=renderer.parse_gpx(data,'UTC')['points'][0]
+        self.assertIsNone(tokyo['recorded_offset_minutes'])
+        self.assertEqual(utc['timestamp']-tokyo['timestamp'],9*3600)
+
     def test_reject_invalid_coordinates(self):
         with self.assertRaises(ValueError):
             renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="nan" lon="2"/></trkseg></trk></gpx>')
