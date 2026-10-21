@@ -225,6 +225,12 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(renderer.frame_offset(plan,plan['source_start'],0),1.25)
         self.assertEqual(renderer.frame_offset(plan,plan['source_start'],32),6.75)
 
+    def test_gap_threshold_has_no_sixty_second_floor(self):
+        points=[dict(offset=t,segment=0) for t in [0,1,2,4,5]]
+        gaps,threshold=renderer.detect_gaps(points)
+        self.assertEqual(threshold,2)
+        self.assertEqual([(g['start'],g['end']) for g in gaps],[(2,4)])
+
     def test_reject_invalid_coordinates(self):
         with self.assertRaises(ValueError):
             renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="nan" lon="2"/></trkseg></trk></gpx>')

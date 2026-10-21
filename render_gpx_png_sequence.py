@@ -136,7 +136,7 @@ def parse_gpx(data, browser_timezone=None):
 def detect_gaps(points, timed=True):
     intervals = [b['offset']-a['offset'] for a,b in zip(points,points[1:])
                  if b['offset']>a['offset'] and a['segment']==b['segment']]
-    threshold = max(60.0,2*median(intervals)) if timed and intervals else None
+    threshold = 2*median(intervals) if timed and intervals else None
     gaps = []
     for i,(a,b) in enumerate(zip(points,points[1:]),1):
         seconds = b['offset']-a['offset']
