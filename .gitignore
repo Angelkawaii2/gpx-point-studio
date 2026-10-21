@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.tile-cache/
+.exports/
+.DS_Store
+
+# Local credentials (only the template is tracked)
+.env
+.env.*
+!.env.example
+# Generated map imagery and local tile databases
+png_sequence*/
+png_workers*/
+tile_cache*/
+*.gpx
+*.fit

@@ -1,0 +1,11 @@
+<layout>
+  <translate x="2" y="2">
+    <frame width="594" height="594" cr="40" opacity="1">
+      <component type="moving_journey_map" name="moving_journey_map"
+                 size="594" zoom="14"
+                 fill="255,0,0" line-width="10"
+                 loc-fill="0,145,255" loc-size="18"
+                 loc-outline="255,255,255" loc-outline-width="5" />
+    </frame>
+  </translate>
+</layout>
