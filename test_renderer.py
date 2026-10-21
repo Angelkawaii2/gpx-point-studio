@@ -217,6 +217,14 @@ class RendererTests(unittest.TestCase):
                 self.assertEqual(draw.call_count,2)
         renderer._preview_png.cache_clear()
 
+    def test_fractional_cursor_boundaries_are_exported_exactly(self):
+        track=dict(points=[dict(offset=0),dict(offset=3),dict(offset=9)])
+        plan=renderer.export_plan(track,dict(start_offset=1.25,end_offset=6.75,export_speed=5,fps=30),0,2)
+        self.assertEqual(plan['source_duration'],5.5)
+        self.assertEqual(plan['frame_count'],33)
+        self.assertEqual(renderer.frame_offset(plan,plan['source_start'],0),1.25)
+        self.assertEqual(renderer.frame_offset(plan,plan['source_start'],32),6.75)
+
     def test_reject_invalid_coordinates(self):
         with self.assertRaises(ValueError):
             renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="nan" lon="2"/></trkseg></trk></gpx>')
