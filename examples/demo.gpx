@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="GPX Point Studio synthetic demo" xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata><name>Synthetic demo — not a recorded activity</name><desc>Invented coordinates and timestamps for documentation and testing.</desc></metadata>
+  <trk><name>Synthetic demonstration</name><trkseg>
+    <trkpt lat="48.8580" lon="2.2940"><time>2026-01-01T00:00:00Z</time></trkpt>
+    <trkpt lat="48.8582" lon="2.2950"><time>2026-01-01T00:00:01Z</time></trkpt>
+    <trkpt lat="48.8584" lon="2.2960"><time>2026-01-01T00:00:02Z</time></trkpt>
+    <trkpt lat="48.8590" lon="2.2965"><time>2026-01-01T00:00:03Z</time></trkpt>
+    <trkpt lat="48.8600" lon="2.2960"><time>2026-01-01T00:00:06Z</time></trkpt>
+    <trkpt lat="48.8602" lon="2.2950"><time>2026-01-01T00:00:07Z</time></trkpt>
+    <trkpt lat="48.8600" lon="2.2940"><time>2026-01-01T00:00:08Z</time></trkpt>
+    <trkpt lat="48.8590" lon="2.2935"><time>2026-01-01T00:00:09Z</time></trkpt>
+    <trkpt lat="48.8580" lon="2.2940"><time>2026-01-01T00:00:10Z</time></trkpt>
+  </trkseg></trk>
+</gpx>

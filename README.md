@@ -2,6 +2,16 @@
 
 [简体中文](#简体中文) · [English](#english)
 
+## 界面语言 / Interface languages
+
+支持简体中文、繁體中文（台灣）、繁體中文（香港）、English、Deutsch、Français。右上角切换，首次跟随浏览器语言，之后记住选择。日期、动态进度和无障碍标签同步翻译。地图标注语言独立配置。
+
+Choose one of six interface languages at the top right. The first visit follows your browser language; later visits remember your choice. Dates, dynamic progress and accessibility labels are localized. Map label language is independent.
+
+![合成轨迹演示 / Synthetic demo](docs/screenshots/overview-zh-CN.png)
+
+[图解操作指南 / Illustrated guide](docs/USAGE.md)
+
 ## 简体中文
 
 一个本地运行的 GPX 地图 PNG 序列工具，带网页编辑和命令行导出。网页按 GPX 实际时间插值生成连续 PNG 序列；命令行保留每个原始 GPS 点位一张 PNG 的导出方式。
@@ -135,3 +145,17 @@ Leaflet and map tiles require internet access. PNGs include map attribution. Til
 矢量数据缓存于 `.tile-cache/vector-v1/`，自定义语言/分类合成后的瓦片缓存于 `.tile-cache/labels-v2/`，与既有底图缓存共同用于全览、PNG 预览和导出。语言和分类作为缓存键，切换语言不重复下载同一份矢量数据。中文等多语言字体在 macOS 自动查找 Hiragino/STHeiti；Linux 建议安装 Noto Sans CJK 字体，Windows 使用微软雅黑。
 
 Vector data lives under `.tile-cache/vector-v1/`; composed label tiles under `.tile-cache/labels-v2/`. Language and category settings partition composed tiles while reusing source vector data. On macOS CJK fonts are detected automatically; Linux should provide Noto Sans CJK, and Windows uses Microsoft YaHei.
+
+
+## Translation development / 翻译开发
+
+Translations live in `web/locales.json`; `web/i18n.js` applies static and parameterized messages. Keep identical keys and placeholders across all six catalogs. No online translation service is used.
+
+翻译资源位于 `web/locales.json`，各语言须保持相同的键和占位符。
+
+```sh
+.venv/bin/python -m unittest -q test_renderer
+node test_i18n.cjs
+```
+
+Node.js is needed only for translation tests, not to run the application.

@@ -521,9 +521,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(cache_status()); return
             if path == '/api/config':
                 self.send({'carto_key_configured': bool(MAP_API_KEY)}); return
-            if path in ('/','/app.js','/style.css'):
-                name={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}[path]
-                self.send((ROOT/'web'/name).read_bytes(),content={'/':'text/html; charset=utf-8','/app.js':'text/javascript','/style.css':'text/css'}[path]); return
+            if path in ('/','/app.js','/style.css','/i18n.js','/locales.json'):
+                name={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/i18n.js':'i18n.js','/locales.json':'locales.json'}[path]
+                self.send((ROOT/'web'/name).read_bytes(),content={'/':'text/html; charset=utf-8','/app.js':'text/javascript','/style.css':'text/css','/i18n.js':'text/javascript','/locales.json':'application/json; charset=utf-8'}[path]); return
             parts=path.strip('/').split('/')
             if len(parts)==6 and parts[:2]==['api','tiles']:
                 query=parse_qs(self.path.partition('?')[2]);style=parts[2];config=dict(map_labels=query.get('labels',['1'])[0]!='0',label_language=query.get('language',['local'])[0],show_streets=query.get('streets',['1'])[0]!='0',show_places=query.get('places',['1'])[0]!='0',show_pois=query.get('pois',['1'])[0]!='0');label_options(config); z,x,y=int(parts[3]),int(parts[4]),int(parts[5].removesuffix('.png'))

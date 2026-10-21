@@ -14,3 +14,5 @@ png_workers*/
 tile_cache*/
 *.gpx
 *.fit
+# Deliberately synthetic, redistributable documentation example
+!examples/demo.gpx
