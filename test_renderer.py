@@ -200,6 +200,23 @@ class RendererTests(unittest.TestCase):
                 self.assertNotEqual(first,changed)
         renderer._preview_png.cache_clear()
 
+    def test_map_label_variants_and_defaults(self):
+        self.assertEqual(renderer.map_style('dark'),'dark')
+        self.assertEqual(renderer.map_style('dark',False),'dark-nolabels')
+        self.assertEqual(renderer.map_style('light',False),'light-nolabels')
+        self.assertEqual(renderer.map_style('default',False),'default')
+        self.assertIn('/dark_nolabels/',renderer.tile_url('dark-nolabels',14,1,1,api_key='test-key'))
+
+    def test_label_toggle_invalidates_png_preview(self):
+        renderer._preview_png.cache_clear()
+        with patch.dict(renderer.tracks,{'labels-test':dict(points=[dict(lat=1,lon=2)])}):
+            with patch.object(renderer,'render',side_effect=[b'labels',b'no-labels']) as draw:
+                a=renderer.preview_png('labels-test',{},dict(lat=1,lon=2))
+                b=renderer.preview_png('labels-test',dict(map_labels=False),dict(lat=1,lon=2))
+                self.assertNotEqual(a,b)
+                self.assertEqual(draw.call_count,2)
+        renderer._preview_png.cache_clear()
+
     def test_reject_invalid_coordinates(self):
         with self.assertRaises(ValueError):
             renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="nan" lon="2"/></trkseg></trk></gpx>')

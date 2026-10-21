@@ -26,10 +26,11 @@ cp .env.example .env
 - 时间轴起点、终点、当前时间及刻度下方显示录制当地时间：优先使用 GPX 时间戳记录的 UTC 偏移（`Z` 表示 UTC），没有偏移时使用浏览器时区。无时区时间戳也按浏览器时区解析。
 - 时间轴首尾控制裁剪范围，蓝色游标控制当前点；左右箭头逐点移动。
 - 时间轴支持 1–32 倍缩放：使用加减按钮或滚轮，以鼠标位置为中心缩放；使用水平滚动条、触控板或 Shift + 滚轮平移。“显示完整时间轴”恢复全览。聚焦时间轴后可用 `+`、`-`、`0` 操作。
+- Dark / Light 支持“显示地点和街道名称”开关，默认开启；同步应用于全览、PNG 预览和导出。有名称和无名称瓦片分别缓存，默认 OSM 底图保持名称显示。
 - 选择默认 OSM、CARTO Dark 或 Light 样式；支持地图缩放等级 1–19、宽高各 128–4096 像素。PNG 预览与导出共用同一后端渲染器。
 - 时间轴用橙色标出记录空白：阈值为同段正采样间隔中位数的两倍且至少 60 秒；间隔达到阈值或轨迹段断开时标记为空白。导出设置中的“拟合轨迹”默认关闭，空白期间停留于前一点并断开轨迹线；开启后按时间线性补齐空白（包括段间空白），同步影响地图播放、PNG 预览和导出。空白时长仍保留。
 - 线条显示开关、颜色和粗细，以及当前位置圆点的显示开关、直径、填充色、描边颜色和粗细可直接配置，同步应用于地图、PNG 预览和导出。
-- 按 GPX 实际时间播放，播放倍率可选 10、20、50、100、200、500、1000、2000×；导入及调整播放范围时，自动选择能在 10 分钟内播完的最低档（尽量接近 10 分钟），超过上限时用 2000×。可手动切换，界面显示预计播放时长；在同一轨迹段的相邻点之间按实际时间线性插值，位置连续移动（空白及断段是否连接由“拟合轨迹”控制）。时间缺失或非递增时按点位顺序播放，1× 每秒一个点。播放倍率独立于导出倍率。
+- 按 GPX 实际时间播放，播放倍率可选 0.5、1、2、4、8、10、16、20、50、64、100、200、500、1000、2000×；导入及调整播放范围时，自动选择能在 10 分钟内播完的最低档（尽量接近 10 分钟），超过上限时用 2000×。可手动切换，界面显示预计播放时长；在同一轨迹段的相邻点之间按实际时间线性插值，位置连续移动（空白及断段是否连接由“拟合轨迹”控制）。时间缺失或非递增时按点位顺序播放，1× 每秒一个点。播放倍率独立于导出倍率。
 - 默认导出整个 GPX，可选时间轴裁剪范围。导出倍率支持 1–100× 滑条和数值输入（默认 10×），帧率可选 25、30、50、60（默认 30）。预计时长为原始时长 ÷ 导出倍率，PNG 张数为预计时长 × 帧率向上取整（最少一帧）。首尾均匀采样覆盖选中时段；序列实际时长有不足一帧的取整误差。例如 5 小时 / 5× = 1 小时，30 fps 输出 108,000 张 PNG。后端异步渲染，进度显示百分比、完成/总帧数、已用/预计剩余时间和 ZIP 打包阶段，完成后下载 ZIP：`frame_000001.png` 起的序列及包含坐标、时间和导出设置的 `manifest.json`。
 
 ### API key 与本地配置
@@ -86,10 +87,11 @@ The app opens <http://127.0.0.1:8765> automatically. Use `--port 9000` to change
 - A second row below timeline endpoints, the current time, and ruler ticks shows recording time in the GPX timestamp’s UTC offset (`Z` means UTC), falling back to the browser timezone when absent. Naive timestamps are parsed using the browser timezone as well.
 - Trim with the timeline's start/end handles and seek with the blue playhead. Arrow buttons step through original points.
 - Zoom the timeline from 1× to 32× using its buttons or the mouse wheel. Wheel zoom anchors at the pointer. Pan with the horizontal scrollbar, a trackpad, or Shift + wheel. Reset with “显示完整时间轴”. When the timeline is focused, `+`, `-`, and `0` provide keyboard controls.
+- Dark / Light offer a “显示地点和街道名称” toggle, enabled by default, shared by the overview, PNG preview and export. Labelled and unlabelled tiles have separate caches. The default OSM layer always shows labels.
 - Choose OpenStreetMap, CARTO Dark, or CARTO Light; configure map zoom 1–19 and output width/height of 128–4096 pixels. Preview and export use the same backend renderer.
 - Recording gaps are highlighted in orange on the timeline. The threshold is twice the median positive in-segment sampling interval, with a minimum of 60 seconds. Intervals meeting that threshold and recording-segment breaks are gaps. “拟合轨迹” is off by default: position holds at the earlier point and the route line breaks during gaps. Enable it to linearly interpolate missing positions by time, including segment gaps, consistently in map playback, PNG preview and export. Gaps still count toward duration.
 - Configure line visibility, width and color, plus current-point visibility, diameter, fill color, outline width and color. The overview, PNG preview and export share these settings.
-- Preview playback follows recorded GPX time at 10, 20, 50, 100, 200, 500, 1000, or 2000× speed. Importing or trimming automatically selects the lowest available rate that finishes within ten minutes, capped at 2000×. Manual selection and estimated playback duration remain available, with continuous linear interpolation between timestamps within each track segment. Gap and segment interpolation is controlled by “拟合轨迹”. Missing or non-monotonic timestamps fall back to point order at one point per second at 1×. Playback speed is independent of export speed.
+- Preview playback follows recorded GPX time at 0.5, 1, 2, 4, 8, 10, 16, 20, 50, 64, 100, 200, 500, 1000, or 2000× speed. Importing or trimming automatically selects the lowest available rate that finishes within ten minutes, capped at 2000×. Manual selection and estimated playback duration remain available, with continuous linear interpolation between timestamps within each track segment. Gap and segment interpolation is controlled by “拟合轨迹”. Missing or non-monotonic timestamps fall back to point order at one point per second at 1×. Playback speed is independent of export speed.
 - Export the entire GPX by default or the trimmed range. Export speed has a 1–100× slider and number input (default 10×); choose 25, 30, 50, or 60 fps (default 30). Estimated duration is source duration / export speed. Frame count is rounded up from estimated duration × fps, with a minimum of one frame. Sampling uniformly covers the selected interval including both endpoints; rounding affects duration by less than one frame. A five-hour GPX at 5× and 30 fps produces 108,000 frames for a one-hour sequence. The backend reports percentage, completed/total frames, elapsed time, estimated time remaining, and ZIP packing progress. Archives contain `frame_000001.png` onward and a `manifest.json` with coordinates, timestamps, and settings.
 
 ### API keys and local configuration

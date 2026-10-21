@@ -23,11 +23,13 @@ import xml.etree.ElementTree as ET
 import zipfile
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qs
 
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / '.tile-cache'
 STYLES = {'default': 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', 'dark': 'https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', 'light': 'https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png'}
+for _style in ('dark','light'):
+    STYLES[_style+'-nolabels'] = STYLES[_style].replace('_all/','_nolabels/')
 tracks, jobs = {}, {}
 ENV_FILE = ROOT / '.env'
 config_lock = threading.Lock()
@@ -81,6 +83,10 @@ def save_map_key(value):
         if 'API_KEY_CARTO' in os.environ:
             os.environ['API_KEY_CARTO'] = value
         tile.cache_clear()
+
+
+def map_style(style, labels=True):
+    return style+'-nolabels' if not labels and style in ('dark','light') else style
 
 
 def tile_url(style, z, x, y, api_key=_KEY_DEFAULT):
@@ -308,6 +314,7 @@ def frame_offset(plan, first_offset, frame):
 def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
     from PIL import Image, ImageDraw
     z,w,h,style = settings(config)
+    style = map_style(style,bool(config.get('map_labels',True)))
     paint = drawing_settings(config)
     position = position or points[index]
     cx,cy = project(position['lat'],position['lon'],z)
@@ -341,7 +348,7 @@ def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
 
 def preview_png(track_id, config, position):
     z,w,h,style=settings(config)
-    visual=dict(drawing_settings(config),zoom=z,width=w,height=h,style=style,
+    visual=dict(drawing_settings(config),map_labels=bool(config.get('map_labels',True)),zoom=z,width=w,height=h,style=style,
                 fit_gaps=bool(config.get('fit_gaps',False)))
     return _preview_png(track_id,position['lat'],position['lon'],
                         json.dumps(visual,sort_keys=True),MAP_API_KEY)
@@ -405,7 +412,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send((ROOT/'web'/name).read_bytes(),content={'/':'text/html; charset=utf-8','/app.js':'text/javascript','/style.css':'text/css'}[path]); return
             parts=path.strip('/').split('/')
             if len(parts)==6 and parts[:2]==['api','tiles']:
-                style=parts[2]; z,x,y=int(parts[3]),int(parts[4]),int(parts[5].removesuffix('.png'))
+                style=map_style(parts[2],parse_qs(self.path.partition('?')[2]).get('labels',['1'])[0]!='0'); z,x,y=int(parts[3]),int(parts[4]),int(parts[5].removesuffix('.png'))
                 if style not in STYLES or not 1<=z<=19 or not 0<=y<2**z:
                     raise ValueError('地图瓦片参数无效')
                 image=BytesIO(); tile(style,z,x,y).save(image,format='PNG')

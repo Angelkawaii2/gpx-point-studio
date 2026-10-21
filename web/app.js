@@ -1,7 +1,7 @@
 const $=id=>document.getElementById(id);
 const urls=Object.fromEntries(['default','dark','light'].map(s=>[s,`/api/tiles/${s}/{z}/{x}/{y}.png`]));
 let map=L.map('map',{preferCanvas:true}).setView([31.23,121.47],10),layer,route,cloud,marker,track=null,style='default',index=0,start=0,end=0,playing=false,lastTick=0,playOffset=0,previewTimer;
-function setStyle(s){style=s;if(layer)map.removeLayer(layer);layer=L.tileLayer(urls[s],{minZoom:1,maxZoom:19,attribution:'© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'+(s==='default'?'':' © CARTO')}).addTo(map);document.querySelectorAll('[data-style]').forEach(b=>b.classList.toggle('active',b.dataset.style===s));schedulePreview()}
+function setStyle(s){style=s;if(layer)map.removeLayer(layer);$('mapLabels').disabled=s==='default';layer=L.tileLayer(urls[s]+'?labels='+($('mapLabels').checked?'1':'0'),{minZoom:1,maxZoom:19,attribution:'© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'+(s==='default'?'':' © CARTO')}).addTo(map);document.querySelectorAll('[data-style]').forEach(b=>b.classList.toggle('active',b.dataset.style===s));schedulePreview()}
 setStyle('default');
 async function api(path,data){const r=await fetch(path,{method:'POST',body:JSON.stringify(data),headers:{'Content-Type':'application/json'}});if(!r.ok)throw Error((await r.json()).error);return r.json()}
 function config(){return {...drawingConfig(),id:track.id,index,zoom:+$('zoom').value,width:+$('width').value,height:+$('height').value,offset:playOffset,export_speed:+$('exportSpeed').value,fps:+$('fps').value,style}}
@@ -67,7 +67,7 @@ timelineViewport.addEventListener('wheel',e=>{e.preventDefault();if(e.shiftKey){
 timelineViewport.addEventListener('keydown',e=>{if(e.target!==timelineViewport)return;if(e.key==='+'||e.key==='='){e.preventDefault();zoomTimeline(timelineZoom*1.5)}else if(e.key==='-'){e.preventDefault();zoomTimeline(timelineZoom/1.5)}else if(e.key==='0'){e.preventDefault();resetTimeline()}});
 resetTimeline();
 
-function drawingConfig(){return {fit_gaps:$('fitGaps').checked,show_line:$('showLine').checked,line_width:+$('lineWidth').value,line_color:$('lineColor').value,show_point:$('showPoint').checked,point_diameter:+$('pointDiameter').value,point_color:$('pointColor').value,point_outline_width:+$('pointOutlineWidth').value,point_outline_color:$('pointOutlineColor').value}}
+function drawingConfig(){return {map_labels:$('mapLabels').checked,fit_gaps:$('fitGaps').checked,show_line:$('showLine').checked,line_width:+$('lineWidth').value,line_color:$('lineColor').value,show_point:$('showPoint').checked,point_diameter:+$('pointDiameter').value,point_color:$('pointColor').value,point_outline_width:+$('pointOutlineWidth').value,point_outline_color:$('pointOutlineColor').value}}
 function positionIcon(){const p=drawingConfig(),size=p.point_diameter,border=Math.min(p.point_outline_width,Math.floor(size/2));return L.divIcon({className:'positionMarker',iconSize:[size,size],iconAnchor:[size/2,size/2],html:`<span style="width:${size}px;height:${size}px;background:${p.point_color};border:${border}px solid ${p.point_outline_color}"></span>`})}
 function applyDrawing(){const p=drawingConfig();if(route){route.setLatLngs(routeSegments());route.setStyle({lineCap:'butt',lineJoin:'round',color:p.line_color,weight:p.line_width,opacity:p.show_line&&p.line_width>0?1:0})}if(cloud)cloud.eachLayer(dot=>dot.setStyle({opacity:0,fillOpacity:0}));if(marker){marker.setIcon(positionIcon());const visible=p.show_point&&p.point_diameter>0;marker.setOpacity(visible?1:0);if(visible)marker.dragging.enable();else marker.dragging.disable()}if(track)update();else schedulePreview()}
 for(const id of ['showLine','lineWidth','lineColor','showPoint','pointDiameter','pointColor','pointOutlineWidth','pointOutlineColor'])$(id).addEventListener('input',applyDrawing);
@@ -90,7 +90,9 @@ function routeSegments(){if(!track)return [];const segments=[],fit=$('fitGaps').
 function drawGapBands(){const bands=$('gapBands');bands.replaceChildren();const gaps=track?.gaps||[],duration=track?.points.at(-1).offset||1;for(const gap of gaps){const band=document.createElement('span');band.style.left=`${gap.start/duration*100}%`;band.style.width=`${gap.seconds/duration*100}%`;band.title=`记录空白 ${formatDuration(gap.seconds)}`;bands.appendChild(band)}$('gapLegend').hidden=!gaps.length;$('gapSummary').textContent=`橙色：${gaps.length} 段记录空白${track?.gap_threshold?`（判定阈值 ≥ ${track.gap_threshold.toFixed(1)} 秒）`:''}`}
 $('fitGaps').onchange=applyDrawing;
 
-function choosePlaybackSpeed(duration){const rates=[10,20,50,100,200,500,1000,2000];return rates.find(rate=>duration/rate<=600)??rates.at(-1)}
+function choosePlaybackSpeed(duration){const rates=[0.5,1,2,4,8,10,16,20,50,64,100,200,500,1000,2000];return rates.find(rate=>duration/rate<=600)??rates.at(-1)}
 function showPlaybackEstimate(mode){if(!track)return;const duration=sliderValue(end)-sliderValue(start),rate=+$('speed').value;$('playbackEstimate').textContent=`${mode} ${rate}× · 预计播放 ${formatDuration(duration/rate)}${duration/rate>600?'（已达最高倍率）':''}`}
 function autoPlaybackSpeed(){if(!track)return;$('speed').value=String(choosePlaybackSpeed(sliderValue(end)-sliderValue(start)));showPlaybackEstimate('自动选择')}
 $('speed').onchange=()=>showPlaybackEstimate('手动选择');
+
+$('mapLabels').onchange=()=>setStyle(style);
