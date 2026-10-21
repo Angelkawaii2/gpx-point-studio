@@ -148,6 +148,33 @@ class RendererTests(unittest.TestCase):
         self.assertIsNone(tokyo['recorded_offset_minutes'])
         self.assertEqual(utc['timestamp']-tokyo['timestamp'],9*3600)
 
+    def test_gap_detection_and_optional_time_fit(self):
+        points=[dict(lat=i,lon=i,offset=t,segment=0) for i,t in enumerate([0,30,60,120,150])]
+        gaps,threshold=renderer.detect_gaps(points)
+        self.assertEqual(threshold,60)
+        self.assertEqual(len(gaps),1)
+        self.assertEqual(gaps[0]['start'],60)
+        self.assertEqual(gaps[0]['end'],120)
+        self.assertEqual(renderer.interpolate_position(points,90)['lat'],2)
+        self.assertEqual(renderer.interpolate_position(points,90,fit_gaps=True)['lat'],2.5)
+        self.assertEqual(renderer.interpolate_position(points,45)['lat'],1.5)
+        self.assertEqual(renderer.interpolate_position(points,120)['lat'],3)
+
+    def test_fit_also_bridges_separate_recording_segments(self):
+        points=[dict(lat=0,lon=0,offset=0,segment=0),dict(lat=10,lon=10,offset=100,segment=1)]
+        renderer.detect_gaps(points)
+        self.assertEqual(renderer.interpolate_position(points,50)['lat'],0)
+        self.assertEqual(renderer.interpolate_position(points,50,fit_gaps=True)['lat'],5)
+
+    def test_gap_line_visibility_matches_fit_setting(self):
+        points=[dict(lat=1,lon=2,offset=0,segment=0),dict(lat=1,lon=2.01,offset=100,segment=0,gap_before=True)]
+        config=dict(zoom=14,width=320,height=240,show_point=False,line_color='#00ff00',line_width=4)
+        with patch.object(renderer,'tile',return_value=Image.new('RGB',(256,256),'white')):
+            off=Image.open(BytesIO(renderer.render(points,0,config)))
+            on=Image.open(BytesIO(renderer.render(points,0,dict(config,fit_gaps=True))))
+        self.assertEqual(off.getpixel((190,120)),(255,255,255))
+        self.assertEqual(on.getpixel((190,120)),(0,255,0))
+
     def test_reject_invalid_coordinates(self):
         with self.assertRaises(ValueError):
             renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="nan" lon="2"/></trkseg></trk></gpx>')

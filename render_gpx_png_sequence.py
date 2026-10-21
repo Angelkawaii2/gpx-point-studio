@@ -12,6 +12,7 @@ import json
 import math
 import hashlib
 import re
+from statistics import median
 import os
 from pathlib import Path
 import threading
@@ -122,7 +123,24 @@ def parse_gpx(data, browser_timezone=None):
     timed = timed and all(b['timestamp'] >= a['timestamp'] for a,b in zip(points,points[1:]))
     for i, p in enumerate(points):
         p['offset'] = p['timestamp'] - points[0]['timestamp'] if timed else i
-    return dict(points=points, timed=timed)
+    gaps, threshold = detect_gaps(points, timed)
+    return dict(points=points, timed=timed, gaps=gaps, gap_threshold=threshold)
+
+
+def detect_gaps(points, timed=True):
+    intervals = [b['offset']-a['offset'] for a,b in zip(points,points[1:])
+                 if b['offset']>a['offset'] and a['segment']==b['segment']]
+    threshold = max(60.0,2*median(intervals)) if timed and intervals else None
+    gaps = []
+    for i,(a,b) in enumerate(zip(points,points[1:]),1):
+        seconds = b['offset']-a['offset']
+        missing = seconds>0 and (a['segment']!=b['segment'] or
+                                  (threshold is not None and seconds>=threshold))
+        b['gap_before'] = missing
+        if missing:
+            gaps.append(dict(start=a['offset'],end=b['offset'],seconds=seconds,
+                             from_index=i-1,to_index=i))
+    return gaps,threshold
 
 def project(lat, lon, zoom):
     lat = max(-85.05112878, min(85.05112878, lat))
@@ -253,7 +271,7 @@ def settings(value):
     drawing_settings(value)
     return z,w,h,style
 
-def interpolate_position(points, offset, offsets=None):
+def interpolate_position(points, offset, offsets=None, fit_gaps=False):
     offsets = offsets if offsets is not None else [p['offset'] for p in points]
     offset = max(offsets[0], min(offsets[-1], float(offset)))
     i = max(0, bisect_right(offsets, offset) - 1)
@@ -262,7 +280,8 @@ def interpolate_position(points, offset, offsets=None):
         return dict(a)
     b = points[i+1]
     gap = b['offset'] - a['offset']
-    ratio = (offset-a['offset'])/gap if gap > 0 and a['segment']==b['segment'] else 0
+    is_gap = b.get('gap_before',False) or a['segment']!=b['segment']
+    ratio = (offset-a['offset'])/gap if gap>0 and (not is_gap or fit_gaps) else 0
     delta_lon = (b['lon']-a['lon']+180)%360-180
     return dict(a,lat=a['lat']+(b['lat']-a['lat'])*ratio,
                 lon=(a['lon']+delta_lon*ratio+180)%360-180,offset=offset)
@@ -302,7 +321,7 @@ def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
     for p in points:
         x,y = project(p['lat'],p['lon'],z)
         x = cx + (x-cx+world/2)%world-world/2
-        if previous != p['segment']:
+        if (previous != p['segment'] or p.get('gap_before',False)) and not config.get('fit_gaps',False):
             if len(coords)>1 and paint['show_line'] and paint['line_width']: draw.line(coords,fill=paint['line_color'],width=paint['line_width'])
             coords=[]
         coords.append((x-left,y-top)); previous=p['segment']
@@ -329,7 +348,7 @@ def export_job(job, track, config, start, end):
         with zipfile.ZipFile(path,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as archive:
             for frame in range(plan['frame_count']):
                 offset = frame_offset(plan, points[start]['offset'], frame)
-                position = interpolate_position(points, offset, offsets)
+                position = interpolate_position(points, offset, offsets,fit_gaps=bool(config.get('fit_gaps',False)))
                 archive.writestr(f'frame_{frame+1:06d}.png',render(points,start,config,api_key,position))
                 jobs[job]['done']=frame+1
             jobs[job]['phase']='packing'
@@ -401,7 +420,7 @@ class Handler(BaseHTTPRequestHandler):
                 if 'offset' in data:
                     offset=float(data['offset'])
                     if not math.isfinite(offset): raise ValueError('时间无效')
-                    position=interpolate_position(track['points'],offset)
+                    position=interpolate_position(track['points'],offset,fit_gaps=bool(data.get('fit_gaps',False)))
                 self.send(render(track['points'],index,data,position=position),content='image/png'); return
             if self.path=='/api/export':
                 start,end=int(data.get('start',0)),int(data.get('end',len(track['points'])-1))
