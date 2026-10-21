@@ -6,10 +6,24 @@ import math
 LANGUAGES = ('local','zh-Hans','zh-Hant','en','ja','ko','de','fr','es','ru')
 
 
+POI_CATEGORIES = {'transit': ['bus', 'railway', 'entrance', 'aerialway', 'ferry_terminal', 'bus_stop', 'bus_station', 'station', 'subway', 'tram_stop', 'halt', 'platform'], 'shopping': ['shop', 'clothing_store', 'alcohol_shop', 'music', 'grocery', 'supermarket', 'marketplace', 'department_store', 'bakery', 'butcher', 'seafood'], 'food': ['restaurant', 'fast_food', 'food_court'], 'cafe': ['cafe', 'ice_cream', 'confectionery', 'chocolate'], 'nightlife': ['bar', 'beer', 'pub', 'nightclub', 'biergarten'], 'lodging': ['lodging', 'hotel', 'motel', 'hostel', 'guest_house', 'dormitory'], 'residential': ['residential', 'apartments', 'house', 'housing', 'neighbourhood', 'quarter', 'suburb'], 'office': ['office', 'company', 'coworking', 'industrial', 'commercial'], 'health': ['hospital', 'clinic', 'doctors', 'dentist', 'nursing_home', 'veterinary', 'healthcare'], 'pharmacy': ['pharmacy'], 'education': ['school', 'college', 'university', 'kindergarten', 'educational_institution'], 'library': ['library', 'books'], 'finance': ['bank', 'atm', 'bureau_de_change'], 'government': ['town_hall', 'townhall', 'public_building', 'courthouse', 'community_centre', 'government', 'embassy', 'diplomatic'], 'emergency': ['police', 'fire_station', 'ambulance_station', 'emergency', 'lifeguard'], 'post': ['post', 'post_office', 'post_box', 'parcel_locker', 'courier'], 'culture': ['museum', 'art_gallery', 'gallery', 'artwork', 'arts_centre', 'theatre', 'cinema', 'music_venue'], 'attraction': ['attraction', 'castle', 'ruins', 'monument', 'memorial', 'archaeological_site', 'historic', 'viewpoint'], 'religion': ['place_of_worship', 'cemetery', 'grave_yard', 'church', 'mosque', 'temple', 'synagogue', 'religion'], 'parks': ['park', 'garden', 'nature_reserve', 'wood', 'forest', 'peak', 'spring', 'waterfall', 'beach'], 'sports': ['stadium', 'pitch', 'sports_centre', 'fitness_centre', 'fitness_station', 'golf', 'swimming', 'swimming_pool', 'track', 'tennis', 'basketball', 'soccer', 'sports'], 'recreation': ['playground', 'zoo', 'theme_park', 'amusement_arcade', 'casino', 'aquarium', 'recreation_ground'], 'camping': ['campsite', 'camp_site', 'caravan_site', 'picnic_site', 'shelter', 'wilderness_hut', 'alpine_hut'], 'parking': ['parking', 'parking_entrance', 'motorcycle_parking', 'bicycle_parking'], 'cycling': ['bicycle', 'bicycle_rental', 'bicycle_repair_station'], 'motoring': ['car', 'car_rental', 'car_sharing', 'car_wash', 'car_repair', 'car_parts', 'fuel', 'charging_station', 'taxi'], 'harbor': ['harbor', 'marina', 'dock', 'aerodrome', 'airport', 'helipad', 'terminal'], 'personal': ['laundry', 'hairdresser', 'beauty', 'dry_cleaning', 'massage', 'tailor', 'tattoo'], 'amenities': ['toilets', 'drinking_water', 'fountain', 'bench', 'telephone', 'shower', 'information', 'public_bookcase'], 'utilities': ['recycling', 'waste_basket', 'waste_disposal', 'water_works', 'wastewater_plant', 'power', 'substation', 'water_tower'], 'barriers': ['gate', 'bollard', 'lift_gate', 'barrier', 'stile', 'cycle_barrier', 'toll_booth'], 'other': []}
+
+def poi_category(properties):
+    # Specific subclass wins over broader classes such as shop and office.
+    for field in ('subclass','class'):
+        value=properties.get(field,'')
+        for category,values in POI_CATEGORIES.items():
+            if value in values:return category
+    return 'other'
+
+
 def label_options(config):
     language=config.get('label_language','local')
     if language not in LANGUAGES: raise ValueError('不支持的标注语言')
-    return dict(label_language=language,show_streets=bool(config.get('show_streets',True)),
+    excluded=config.get('poi_excluded',[name for name in POI_CATEGORIES if name not in ('transit','government','parks','attraction')])
+    if not isinstance(excluded,list) or any(name not in POI_CATEGORIES for name in excluded):raise ValueError('Invalid POI categories')
+    sizes={name:max(6,min(48,int(config.get(name,13)))) for name in ('street_font_size','place_font_size','poi_font_size')}
+    return dict(**sizes,poi_excluded=sorted(set(excluded)),label_language=language,show_streets=bool(config.get('show_streets',True)),
                 show_places=bool(config.get('show_places',True)),show_pois=bool(config.get('show_pois',True)))
 
 
@@ -57,8 +71,10 @@ def draw_labels(base, layers, z, x, y, options):
         extent=layer.get('extent',4096)
         for feature in features:
             props=feature.get('properties',{});text=label_name(props,options['label_language'])
+            if layer_name=='poi' and poi_category(props) in options.get('poi_excluded',[]):continue
             if layer_name=='place':
                 kind_class=props.get('class','')
+                if kind_class in ('neighbourhood','quarter','suburb','residential') and 'residential' in options.get('poi_excluded',[]):continue
                 if (z>=13 and kind_class in ('country','state','city','town')) or (z>=16 and kind_class=='suburb'):continue
             if not text or len(text)>100:continue
             geometry=feature.get('geometry',{});kind=geometry.get('type');points=geometry.get('coordinates',[])
@@ -88,7 +104,7 @@ def draw_labels(base, layers, z, x, y, options):
                 if angle< -90:angle+=180
             else:continue
             if not -80<px<336 or not -40<py<296:continue
-            size=13 if layer_name=='place' else 11
+            size=options[{'place':'place_font_size','transportation_name':'street_font_size','poi':'poi_font_size'}[layer_name]]
             font=font_for(options['label_language'],size)
             box=font.getbbox(text);w,h=box[2]-box[0],box[3]-box[1]
             if layer_name=='transportation_name' and length<w*.65:continue

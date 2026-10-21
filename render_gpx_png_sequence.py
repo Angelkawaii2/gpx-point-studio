@@ -2,6 +2,8 @@
 """GPX point-by-point PNG renderer and local web application."""
 from __future__ import annotations
 import argparse
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import multiprocessing
 from bisect import bisect_right
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -335,12 +337,12 @@ def labelled_map_tile(cache_dir,style,z,x,y,options_json,api_key):
 
 def drawing_settings(value):
     result = {}
-    for name, default, low, high in [('line_width',4,0,100), ('point_diameter',18,0,200), ('point_outline_width',3,0,30)]:
+    for name, default, low, high in [('line_width',8,0,100), ('point_diameter',30,0,200), ('point_outline_width',3,0,30)]:
         number = float(value.get(name, default))
         if not math.isfinite(number) or not low <= number <= high:
             raise ValueError(f'{name} 必须在 {low}–{high} 之间')
         result[name] = round(number)
-    for name, default in [('line_color','#ff694b'), ('point_color','#29b5ff'), ('point_outline_color','#ffffff')]:
+    for name, default in [('line_color','#ff0000'), ('point_color','#29b5ff'), ('point_outline_color','#ffffff')]:
         color = value.get(name, default)
         if not isinstance(color, str) or not re.fullmatch(r'#[0-9a-fA-F]{6}',color):
             raise ValueError(f'{name} 颜色格式须为 #RRGGBB')
@@ -351,7 +353,7 @@ def drawing_settings(value):
 
 def settings(value):
     z, w, h = int(value.get('zoom',14)), int(value.get('width',600)), int(value.get('height',600))
-    style = value.get('style','default')
+    style = value.get('style','dark')
     if not 1 <= z <= 19 or not 128 <= w <= 4096 or not 128 <= h <= 4096 or style not in STYLES:
         raise ValueError('缩放等级须为 1–19，宽高须为 128–4096，地图样式无效')
     drawing_settings(value)
@@ -423,6 +425,26 @@ def frame_offset(plan, first_offset, frame):
     return first_offset + (plan['source_duration']*frame/(count-1) if count>1 else 0)
 
 
+def clipped_route(points, config):
+    """Clip the drawn route, retaining precise interpolated selection endpoints."""
+    if not points or 'start_offset' not in config or 'end_offset' not in config:
+        return points
+    first=max(points[0]['offset'],float(config['start_offset']))
+    last=min(points[-1]['offset'],float(config['end_offset']))
+    if last<first:return []
+    offsets=[p['offset'] for p in points]
+    def boundary(offset):
+        result=interpolate_position(points,offset,offsets,fit_gaps=bool(config.get('fit_gaps',False)))
+        i=max(0,bisect_right(offsets,offset)-1)
+        a=points[i];b=points[min(i+1,len(points)-1)]
+        result['gap_before']=bool(a.get('gap_before',False) if offset==a['offset'] else b.get('gap_before',False) or a['segment']!=b['segment'])
+        return result
+    result=[boundary(first)]
+    result.extend(p for p in points if first<p['offset']<last)
+    if last>first:result.append(boundary(last))
+    return result
+
+
 def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
     from PIL import Image, ImageDraw
     z,w,h,style = settings(config)
@@ -438,7 +460,7 @@ def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
     coords = []
     previous = None
     world = 256*2**z
-    for p in points:
+    for p in clipped_route(points,config):
         x,y = project(p['lat'],p['lon'],z)
         x = cx + (x-cx+world/2)%world-world/2
         if (previous != p['segment'] or p.get('gap_before',False)) and not config.get('fit_gaps',False):
@@ -461,6 +483,8 @@ def preview_png(track_id, config, position):
     z,w,h,style=settings(config)
     visual=dict(drawing_settings(config),**label_options(config),map_labels=bool(config.get('map_labels',True)),zoom=z,width=w,height=h,style=style,
                 fit_gaps=bool(config.get('fit_gaps',False)))
+    for name in ('start_offset','end_offset'):
+        if name in config:visual[name]=float(config[name])
     return _preview_png(track_id,position['lat'],position['lon'],
                         json.dumps(visual,sort_keys=True),MAP_API_KEY)
 
@@ -482,6 +506,44 @@ def render_sequence(points, positions, config, api_key=_KEY_DEFAULT):
         yield previous_png,reused
 
 
+def viewport_tiles(position, config):
+    z,w,h,_=settings(config)
+    cx,cy=project(position['lat'],position['lon'],z)
+    left,top=round(cx-w/2),round(cy-h/2)
+    return {(x%(2**z),y) for y in range(top//256,(top+h-1)//256+1)
+            for x in range(left//256,(left+w-1)//256+1) if 0<=y<2**z}
+
+
+def initialize_render_worker(points, config, api_key):
+    global worker_points, worker_config, worker_key
+    worker_points,worker_config,worker_key=points,config,api_key
+
+
+def render_worker(position):
+    return render(worker_points,0,worker_config,worker_key,position)
+
+
+def parallel_frames(points, positions, config, api_key, workers):
+    """Bound queued PNG memory while retaining consecutive identical-frame reuse."""
+    from collections import deque
+    with ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context('spawn'),
+            initializer=initialize_render_worker,initargs=(points,config,api_key)) as pool:
+        pending=deque();previous_coordinates=None;previous_future=None
+        def submit(position):
+            nonlocal previous_coordinates,previous_future
+            coordinates=(position['lat'],position['lon'])
+            reused=previous_future is not None and coordinates==previous_coordinates
+            future=previous_future if reused else pool.submit(render_worker,position)
+            previous_coordinates,previous_future=coordinates,future
+            return future,reused
+        for position in positions:
+            pending.append(submit(position))
+            if len(pending)>=workers*2:
+                future,reused=pending.popleft();yield future.result(),reused
+        while pending:
+            future,reused=pending.popleft();yield future.result(),reused
+
+
 def export_job(job, track, config, start, end):
     try:
         api_key = MAP_API_KEY
@@ -489,14 +551,34 @@ def export_job(job, track, config, start, end):
         points = track['points']
         offsets = [p['offset'] for p in points]
         assignments,_=point_frame_assignments(points,plan)
+        def positions():
+            return (points[assignments[frame]] if frame in assignments else
+                    interpolate_position(points,frame_offset(plan,plan['source_start'],frame),offsets,
+                    fit_gaps=bool(config.get('fit_gaps',False))) for frame in range(plan['frame_count']))
+        state=jobs[job]
+        state.update(phase='preparing',tile_done=0,tile_total=0,workers=os.cpu_count() or 1)
+        needed=set()
+        for position in positions():needed.update(viewport_tiles(position,config))
+        download_workers=max(1,min(32,int(config.get('download_workers',8))))
+        state.update(phase='downloading',tile_total=len(needed),download_workers=download_workers)
+        z,_,_,style=settings(config)
+        def preload(coordinate):
+            map_tile(style,z,*coordinate,config,api_key)
+        with ThreadPoolExecutor(max_workers=download_workers) as pool:
+            # Bounded batches avoid queuing every tile at once.
+            iterator=iter(needed)
+            while True:
+                from itertools import islice
+                batch=list(islice(iterator,download_workers*2))
+                if not batch:break
+                for future in as_completed([pool.submit(preload,item) for item in batch]):
+                    future.result();state['tile_done']+=1
+        state.update(phase='rendering',phase_started=time.monotonic())
         folder=ROOT/'.exports'; folder.mkdir(exist_ok=True)
         path=folder/f'{job}.zip'
         with zipfile.ZipFile(path,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as archive:
             jobs[job].update(rendered=0,reused=0)
-            positions = (points[assignments[frame]] if frame in assignments else
-                         interpolate_position(points,frame_offset(plan,plan['source_start'],frame),offsets,
-                         fit_gaps=bool(config.get('fit_gaps',False))) for frame in range(plan['frame_count']))
-            for frame,(png,reused) in enumerate(render_sequence(points,positions,config,api_key)):
+            for frame,(png,reused) in enumerate(parallel_frames(points,positions(),config,api_key,state['workers'])):
                 archive.writestr(f'frame_{frame+1:06d}.png',png)
                 jobs[job]['reused' if reused else 'rendered'] += 1
                 jobs[job]['done']=frame+1
@@ -526,7 +608,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send((ROOT/'web'/name).read_bytes(),content={'/':'text/html; charset=utf-8','/app.js':'text/javascript','/style.css':'text/css','/i18n.js':'text/javascript','/locales.json':'application/json; charset=utf-8'}[path]); return
             parts=path.strip('/').split('/')
             if len(parts)==6 and parts[:2]==['api','tiles']:
-                query=parse_qs(self.path.partition('?')[2]);style=parts[2];config=dict(map_labels=query.get('labels',['1'])[0]!='0',label_language=query.get('language',['local'])[0],show_streets=query.get('streets',['1'])[0]!='0',show_places=query.get('places',['1'])[0]!='0',show_pois=query.get('pois',['1'])[0]!='0');label_options(config); z,x,y=int(parts[3]),int(parts[4]),int(parts[5].removesuffix('.png'))
+                query=parse_qs(self.path.partition('?')[2]);style=parts[2];config=dict(map_labels=query.get('labels',['1'])[0]!='0',label_language=query.get('language',['local'])[0],show_streets=query.get('streets',['1'])[0]!='0',show_places=query.get('places',['1'])[0]!='0',show_pois=query.get('pois',['1'])[0]!='0');
+                if 'poi_excluded' in query:config['poi_excluded']=json.loads(query['poi_excluded'][0])
+                config.update({name:query.get(name,['13'])[0] for name in ('street_font_size','place_font_size','poi_font_size')});label_options(config); z,x,y=int(parts[3]),int(parts[4]),int(parts[5].removesuffix('.png'))
                 if style not in STYLES or not 1<=z<=19 or not 0<=y<2**z:
                     raise ValueError('地图瓦片参数无效')
                 image=BytesIO(); map_tile(style,z,x,y,config).save(image,format='PNG')
@@ -535,7 +619,7 @@ class Handler(BaseHTTPRequestHandler):
                 job=jobs[parts[2]]
                 elapsed=time.monotonic()-job['started']
                 result={k:v for k,v in job.items() if k not in ('path','started')}
-                result.update(elapsed=elapsed,eta=(elapsed/job['done']*(job['total']-job['done'])) if job['done'] else None)
+                result.update(elapsed=elapsed,eta=((time.monotonic()-job.get('phase_started',job['started']))/job['done']*(job['total']-job['done'])) if job['done'] else None)
                 self.send(result); return
             if len(parts)==3 and parts[:2]==['api','download']:
                 job=jobs[parts[2]]
@@ -577,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not 0<=start<=end<len(track['points']): raise ValueError('导出范围无效')
                 if any(j['status']=='running' for j in jobs.values()): raise ValueError('已有导出任务正在运行')
                 plan=export_plan(track,data,start,end)
-                key=uuid.uuid4().hex; jobs[key]=dict(status='running',phase='rendering',done=0,total=plan['frame_count'],started=time.monotonic(),timing=plan)
+                key=uuid.uuid4().hex; jobs[key]=dict(status='running',phase='preparing',done=0,total=plan['frame_count'],started=time.monotonic(),timing=plan)
                 threading.Thread(target=export_job,args=(key,track,data,start,end),daemon=True).start()
                 self.send(dict(id=key)); return
             self.send({'error':'Not found'},404)
@@ -587,7 +671,7 @@ def main():
     parser=argparse.ArgumentParser(description='默认启动网页；指定 GPX 和输出目录则每个原始点输出一张 PNG。')
     parser.add_argument('gpx',type=Path,nargs='?'); parser.add_argument('output_dir',type=Path,nargs='?')
     parser.add_argument('--zoom',type=int,default=14); parser.add_argument('--size',default='600x600')
-    parser.add_argument('--map-style',choices=STYLES,default='default'); parser.add_argument('--port',type=int,default=8765)
+    parser.add_argument('--map-style',choices=STYLES,default='dark'); parser.add_argument('--port',type=int,default=8765)
     parser.add_argument('--no-browser',action='store_true')
     args=parser.parse_args()
     if args.gpx:

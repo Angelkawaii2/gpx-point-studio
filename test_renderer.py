@@ -9,6 +9,38 @@ import render_gpx_png_sequence as renderer
 
 
 class RendererTests(unittest.TestCase):
+    def test_poi_filter_classification_and_rendering(self):
+        from map_labels import poi_category,label_options,draw_labels,POI_CATEGORIES
+        self.assertEqual(len(POI_CATEGORIES),32)
+        for props,expected in [({'class':'bus','subclass':'bus_stop'},'transit'),({'class':'shop','subclass':'convenience'},'shopping'),({'class':'residential'},'residential'),({'class':'unknown'},'other')]:
+            self.assertEqual(poi_category(props),expected)
+        base=Image.new('RGB',(256,256),'#202020')
+        layers={'poi':dict(extent=256,features=[dict(properties=dict(name='Bus stop',**{'class':'bus'}),geometry=dict(type='Point',coordinates=[128,128]))])}
+        visible=draw_labels(base,layers,14,0,0,label_options({}))
+        hidden=draw_labels(base,layers,14,0,0,label_options(dict(poi_excluded=['transit'])))
+        self.assertNotEqual(visible.tobytes(),base.tobytes())
+        self.assertEqual(hidden.tobytes(),base.tobytes())
+        self.assertNotEqual(label_options({}),label_options(dict(poi_excluded=['transit'])))
+        self.assertEqual(set(POI_CATEGORIES)-set(label_options({})['poi_excluded']),{'transit','government','parks','attraction'})
+        with self.assertRaises(ValueError):label_options(dict(poi_excluded=['invalid']))
+
+    def test_route_clipping_preserves_fractional_boundaries(self):
+        points=[dict(lat=0,lon=i,offset=i*10,segment=0) for i in range(4)]
+        route=renderer.clipped_route(points,dict(start_offset=5,end_offset=25))
+        self.assertEqual([p['offset'] for p in route],[5,10,20,25])
+        self.assertEqual([p['lon'] for p in route],[.5,1,2,2.5])
+        self.assertEqual(renderer.clipped_route(points,{}),points)
+
+    def test_preview_cache_separates_trim_boundaries(self):
+        points=[dict(lat=0,lon=i,offset=i*10,segment=0) for i in range(3)]
+        renderer._preview_png.cache_clear()
+        with patch.dict(renderer.tracks,{'trim-test':dict(points=points)}):
+            with patch.object(renderer,'render',return_value=b'png') as draw:
+                renderer.preview_png('trim-test',dict(start_offset=0,end_offset=20),points[1])
+                renderer.preview_png('trim-test',dict(start_offset=5,end_offset=15),points[1])
+                self.assertEqual(draw.call_count,2)
+                self.assertEqual(draw.call_args.args[2]['start_offset'],5)
+
     def test_preserves_duplicate_points_and_irregular_timing(self):
         track = renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="1" lon="2"><time>2026-01-01T00:00:00Z</time></trkpt><trkpt lat="1" lon="2"><time>2026-01-01T00:00:07Z</time></trkpt></trkseg></trk></gpx>')
         self.assertEqual(len(track['points']), 2)
@@ -243,7 +275,7 @@ class RendererTests(unittest.TestCase):
         off=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_streets=False,show_places=False,show_pois=False)),_dark=True))
         self.assertEqual(off.tobytes(),base.tobytes())
         roads=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_places=False,show_pois=False,label_language='en')),_dark=True))
-        pois=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_places=False,show_streets=False,label_language='en')),_dark=True))
+        pois=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_places=False,show_streets=False,label_language='en',poi_excluded=[])),_dark=True))
         self.assertNotEqual(roads.tobytes(),base.tobytes())
         self.assertNotEqual(pois.tobytes(),base.tobytes())
         self.assertNotEqual(roads.tobytes(),pois.tobytes())

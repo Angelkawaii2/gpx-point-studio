@@ -58,3 +58,17 @@ Keys stay in local .env and are not returned to the page. Do not overwrite an ex
 GPX 在本机处理。地图提供方会收到所查看区域的瓦片请求，网页也会加载 Leaflet CDN。地图来源署名保留。截图只使用合成数据。
 
 GPX processing runs locally. Map providers receive tile requests for viewed areas; the page also loads Leaflet from a CDN. Attribution remains visible. Screenshots use synthetic data only.
+
+默认地图为 Dark，页面使用深色界面。地图设置支持街道、地名、POI 独立字号，默认 13px，可设 6–48px；同步应用于全览、预览及导出。Default OSM 的嵌入文字不受此设置影响。
+
+Dark is the default map and the interface uses a dark theme. Street, place and POI font sizes are independently adjustable from 6 to 48px (default 13px), shared by overview, preview and export. Default OSM embedded labels are unaffected.
+
+## 导出阶段 / Export phases
+
+导出先计算全部输出帧所需的瓦片，再用 1–32 个下载线程（默认 8）预加载到共享缓存。缓存已有瓦片直接复用。全部就绪后，使用系统全部逻辑 CPU 核心进行多进程渲染，按帧顺序写入 ZIP；连续相同画面仍只渲染一次。页面依次显示准备、瓦片下载数量、渲染进度、打包和完成。下载数量包含缓存命中的已就绪瓦片。
+
+Export plans required tiles, then preloads the shared cache using 1–32 download threads (default 8). Cached tiles are reused. Rendering then uses all logical CPU cores with separate processes, preserving frame order and consecutive identical-frame reuse. The UI shows preparation, ready/total tiles, rendering, ZIP packing and completion. Ready tiles include cache hits.
+
+地图设置 → POI 类型筛选：32 类独立开关，默认仅启用公共交通、政府与公共服务、公园花园与自然、景点与历史遗迹。对 Dark/Light 生效，同步全览、预览与导出。住宅类也控制 neighbourhood、quarter、suburb 等已有地名标签；数据源未提供的名称不会生成。Default 的嵌入标签无法按类筛选。
+
+Map settings → POI categories offers 32 independent switches (only public transport, civic services, parks/nature and attractions/heritage enabled by default) for Dark/Light, shared by overview, preview and export. Residential also filters available neighbourhood/quarter/suburb place labels. Missing source labels cannot be generated; Default embedded labels cannot be filtered. Classification uses OpenMapTiles class/subclass fields: https://openmaptiles.org/schema/#poi .
