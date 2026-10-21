@@ -8,6 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 import json
 import math
+import hashlib
+import re
 import os
 from pathlib import Path
 import threading
@@ -16,6 +18,7 @@ import uuid
 import webbrowser
 import xml.etree.ElementTree as ET
 import zipfile
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
@@ -25,6 +28,20 @@ STYLES = {'default': 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', 'dark': '
 tracks, jobs = {}, {}
 ENV_FILE = ROOT / '.env'
 config_lock = threading.Lock()
+cache_lock = threading.Lock()
+tile_locks = [threading.Lock() for _ in range(64)]
+cache_counters = dict(disk_hits=0, downloads=0, errors=0, active=0, last_error='')
+_inventory = dict(time=0, files=0, bytes=0, by_style={})
+_KEY_DEFAULT = object()
+# CARTO can return these authentication placeholders with HTTP 200.
+AUTH_TILE_HASHES = {
+    'd36df23c63879d10e90e52f7ccd86148998030867958151e8e8d026a7338b47b',
+    '4adce5fc1b6b53c4ac03387defd4120b6ebdcd188be696649ae851b2e4f53db8',
+}
+
+
+class TileAuthorizationError(RuntimeError):
+    pass
 
 
 def load_map_key():
@@ -63,10 +80,11 @@ def save_map_key(value):
         tile.cache_clear()
 
 
-def tile_url(style, z, x, y):
+def tile_url(style, z, x, y, api_key=_KEY_DEFAULT):
+    api_key = MAP_API_KEY if api_key is _KEY_DEFAULT else api_key
     url = STYLES[style].format(z=z, x=x, y=y)
-    if style != 'default' and MAP_API_KEY:
-        url += '?' + urlencode({'key': MAP_API_KEY})
+    if style != 'default' and api_key:
+        url += '?' + urlencode({'key': api_key})
     return url
 
 def parse_gpx(data):
@@ -100,48 +118,140 @@ def project(lat, lon, zoom):
     s = 256 * 2 ** zoom
     return ((lon + 180) / 360 * s, (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * s)
 
-@lru_cache(maxsize=512)
-def tile(style, z, x, y):
+def cache_scope(style, api_key):
+    # Separate credentials and the new cache format from legacy watermarked tiles.
+    return 'public' if style == 'default' else hashlib.sha256(api_key.encode()).hexdigest()[:20]
+
+
+def cache_status():
+    with cache_lock:
+        if time.monotonic() - _inventory['time'] > 3:
+            files, size, by_style = 0, 0, {}
+            for path in (CACHE / 'v2').glob('*/*/*/*/*.png'):
+                try:
+                    amount = path.stat().st_size
+                except FileNotFoundError:
+                    continue
+                style = path.relative_to(CACHE / 'v2').parts[0]
+                entry = by_style.setdefault(style, dict(files=0, bytes=0))
+                entry['files'] += 1; entry['bytes'] += amount
+                files += 1; size += amount
+            _inventory.update(time=time.monotonic(), files=files, bytes=size, by_style=by_style)
+        info = _cached_tile.cache_info()
+        return dict(**cache_counters, files=_inventory['files'], bytes=_inventory['bytes'],
+                    by_style=_inventory['by_style'], memory_hits=info.hits,
+                    memory_tiles=info.currsize, key_configured=bool(MAP_API_KEY))
+
+
+def tile(style, z, x, y, api_key=_KEY_DEFAULT):
     from PIL import Image
+    api_key = MAP_API_KEY if api_key is _KEY_DEFAULT else api_key
     n = 2 ** z
     if not 0 <= y < n:
         return Image.new('RGB', (256,256), '#d9e1e5')
+    if style != 'default' and not api_key:
+        raise ValueError('CARTO Dark / Light 需要 API key，请在右侧设置后重试')
     x %= n
-    path = CACHE / style / str(z) / str(x) / f'{y}.png'
+    identity = (str(CACHE), style, cache_scope(style, api_key), z, x, y, api_key)
+    # Concurrent preview/export requests for the same tile download only once.
+    with tile_locks[hash(identity) % len(tile_locks)]:
+        return _cached_tile(*identity)
+
+
+def clear_tile_memory():
+    _cached_tile.cache_clear()
+
+
+tile.cache_clear = clear_tile_memory
+
+
+@lru_cache(maxsize=512)
+def _cached_tile(cache_dir, style, scope, z, x, y, api_key):
+    from PIL import Image
+    path = Path(cache_dir) / 'v2' / style / scope / str(z) / str(x) / f'{y}.png'
     if path.exists():
-        with Image.open(path) as im: return im.convert('RGB')
-    url = tile_url(style,z,x,y)
-    for attempt in range(3):
         try:
-            with urlopen(Request(url, headers={'User-Agent':'GPXPointStudio/1.0 (local GPX PNG renderer)'}), timeout=25) as response:
-                data = response.read()
-            with Image.open(BytesIO(data)) as im: result = im.convert('RGB')
-            path.parent.mkdir(parents=True,exist_ok=True)
-            temp = path.with_suffix(f'.{uuid.uuid4().hex}.tmp')
-            temp.write_bytes(data)
-            temp.replace(path)
+            with Image.open(path) as im:
+                result = im.convert('RGB')
+                if result.size != (256, 256): raise ValueError('invalid tile')
+            with cache_lock: cache_counters['disk_hits'] += 1
             return result
-        except Exception:
-            if attempt == 2:
-                raise RuntimeError('地图瓦片请求失败，请检查网络、地图服务和 API key') from None
-            time.sleep(attempt + 1)
+        except (OSError, ValueError):
+            path.unlink(missing_ok=True)
+    url = tile_url(style,z,x,y,api_key)
+    with cache_lock: cache_counters['active'] += 1
+    try:
+        for attempt in range(3):
+            try:
+                with urlopen(Request(url, headers={'User-Agent':'GPXPointStudio/1.0 (local GPX PNG renderer)'}), timeout=25) as response:
+                    data = response.read()
+                with Image.open(BytesIO(data)) as im:
+                    result = im.convert('RGB')
+                    if result.size != (256,256): raise ValueError('invalid tile dimensions')
+                if hashlib.sha256(result.tobytes()).hexdigest() in AUTH_TILE_HASHES:
+                    raise TileAuthorizationError('地图服务返回 API KEY REQUIRED 水印，请检查 key 或访问限制')
+                path.parent.mkdir(parents=True,exist_ok=True)
+                temp = path.with_suffix(f'.{uuid.uuid4().hex}.tmp')
+                try:
+                    temp.write_bytes(data)
+                    temp.replace(path)
+                finally: temp.unlink(missing_ok=True)
+                with cache_lock:
+                    cache_counters['downloads'] += 1
+                    cache_counters['last_error'] = ''
+                    _inventory['time'] = 0
+                return result
+            except Exception as exc:
+                if isinstance(exc, TileAuthorizationError):
+                    message = str(exc)
+                    break
+                if isinstance(exc, HTTPError) and exc.code in (401,403):
+                    message = 'CARTO API key 未通过验证或访问受限（HTTP %s）' % exc.code
+                    break
+                message = '地图瓦片请求失败，请检查网络或 API key'
+                if attempt < 2: time.sleep(attempt + 1)
+        with cache_lock:
+            cache_counters['errors'] += 1
+            cache_counters['last_error'] = message
+        raise RuntimeError(message) from None
+    finally:
+        with cache_lock: cache_counters['active'] -= 1
+
+
+def drawing_settings(value):
+    result = {}
+    for name, default, low, high in [('line_width',4,0,100), ('point_diameter',18,0,200), ('point_outline_width',3,0,30)]:
+        number = float(value.get(name, default))
+        if not math.isfinite(number) or not low <= number <= high:
+            raise ValueError(f'{name} 必须在 {low}–{high} 之间')
+        result[name] = round(number)
+    for name, default in [('line_color','#ff694b'), ('point_color','#29b5ff'), ('point_outline_color','#ffffff')]:
+        color = value.get(name, default)
+        if not isinstance(color, str) or not re.fullmatch(r'#[0-9a-fA-F]{6}',color):
+            raise ValueError(f'{name} 颜色格式须为 #RRGGBB')
+        result[name] = color
+    result['show_line'] = bool(value.get('show_line',True))
+    result['show_point'] = bool(value.get('show_point',True))
+    return result
 
 def settings(value):
     z, w, h = int(value.get('zoom',14)), int(value.get('width',600)), int(value.get('height',600))
     style = value.get('style','default')
     if not 1 <= z <= 19 or not 128 <= w <= 4096 or not 128 <= h <= 4096 or style not in STYLES:
         raise ValueError('缩放等级须为 1–19，宽高须为 128–4096，地图样式无效')
+    drawing_settings(value)
     return z,w,h,style
 
-def render(points, index, config):
+def render(points, index, config, api_key=_KEY_DEFAULT):
     from PIL import Image, ImageDraw
     z,w,h,style = settings(config)
+    paint = drawing_settings(config)
     cx,cy = project(points[index]['lat'],points[index]['lon'],z)
     left,top = round(cx-w/2), round(cy-h/2)
     im = Image.new('RGB',(w,h))
     for ty in range(top//256,(top+h-1)//256+1):
         for tx in range(left//256,(left+w-1)//256+1):
-            im.paste(tile(style,z,tx,ty),(tx*256-left,ty*256-top))
+            im.paste(tile(style,z,tx,ty,api_key),(tx*256-left,ty*256-top))
     draw = ImageDraw.Draw(im)
     coords = []
     previous = None
@@ -150,12 +260,15 @@ def render(points, index, config):
         x,y = project(p['lat'],p['lon'],z)
         x = cx + (x-cx+world/2)%world-world/2
         if previous != p['segment']:
-            if len(coords)>1: draw.line(coords,fill='#ff694b',width=4)
+            if len(coords)>1 and paint['show_line'] and paint['line_width']: draw.line(coords,fill=paint['line_color'],width=paint['line_width'])
             coords=[]
         coords.append((x-left,y-top)); previous=p['segment']
-    if len(coords)>1: draw.line(coords,fill='#ff694b',width=4)
+    if len(coords)>1 and paint['show_line'] and paint['line_width']: draw.line(coords,fill=paint['line_color'],width=paint['line_width'])
     x,y=cx-left,cy-top
-    draw.ellipse((x-9,y-9,x+9,y+9),fill='#29b5ff',outline='white',width=3)
+    diameter = paint['point_diameter']
+    if paint['show_point'] and diameter:
+        r = diameter / 2
+        draw.ellipse((x-r,y-r,x+r-1,y+r-1),fill=paint['point_color'],outline=paint['point_outline_color'],width=min(paint['point_outline_width'],max(1,diameter//2)))
     credit = '© OpenStreetMap contributors' + (' © CARTO' if style != 'default' else '')
     box = draw.textbbox((0,0),credit)
     draw.rectangle((0,h-20,box[2]+12,h),fill='white')
@@ -164,11 +277,12 @@ def render(points, index, config):
 
 def export_job(job, track, config, start, end):
     try:
+        api_key = MAP_API_KEY
         folder=ROOT/'.exports'; folder.mkdir(exist_ok=True)
         path=folder/f'{job}.zip'
         with zipfile.ZipFile(path,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as archive:
             for number,index in enumerate(range(start,end+1),1):
-                archive.writestr(f'frame_{number:06d}.png',render(track['points'],index,config))
+                archive.writestr(f'frame_{number:06d}.png',render(track['points'],index,config,api_key))
                 jobs[job]['done']=number
             archive.writestr('manifest.json',json.dumps(dict(settings=config,start=start,end=end,points=track['points'][start:end+1]),ensure_ascii=False))
         jobs[job].update(status='complete',path=str(path))
@@ -178,10 +292,12 @@ def export_job(job, track, config, start, end):
 class Handler(BaseHTTPRequestHandler):
     def send(self,data,status=200,content='application/json'):
         if content=='application/json': data=json.dumps(data,ensure_ascii=False).encode()
-        self.send_response(status); self.send_header('Content-Type',content); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+        self.send_response(status); self.send_header('Cache-Control','no-store'); self.send_header('Content-Type',content); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         try:
             path=self.path.split('?')[0]
+            if path == '/api/cache':
+                self.send(cache_status()); return
             if path == '/api/config':
                 self.send({'carto_key_configured': bool(MAP_API_KEY)}); return
             if path in ('/','/app.js','/style.css'):
