@@ -188,6 +188,18 @@ class RendererTests(unittest.TestCase):
             p=renderer.interpolate_position(points,offset)
             self.assertEqual((p['lat'],p['lon']),(1.28,103.85))
 
+    def test_preview_reuses_same_visual_frame_but_not_changed_style(self):
+        renderer._preview_png.cache_clear()
+        with patch.dict(renderer.tracks,{'preview-test':dict(points=[dict(lat=1,lon=2)])}):
+            with patch.object(renderer,'render',side_effect=[b'same',b'new-style']) as draw:
+                first=renderer.preview_png('preview-test',dict(offset=0),dict(lat=1,lon=2))
+                second=renderer.preview_png('preview-test',dict(offset=100,fps=60),dict(lat=1,lon=2))
+                changed=renderer.preview_png('preview-test',dict(line_color='#123456'),dict(lat=1,lon=2))
+                self.assertEqual(draw.call_count,2)
+                self.assertEqual(first,second)
+                self.assertNotEqual(first,changed)
+        renderer._preview_png.cache_clear()
+
     def test_reject_invalid_coordinates(self):
         with self.assertRaises(ValueError):
             renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="nan" lon="2"/></trkseg></trk></gpx>')

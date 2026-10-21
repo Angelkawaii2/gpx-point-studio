@@ -339,6 +339,19 @@ def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
     draw.text((6,h-16),credit,fill='black')
     out=BytesIO(); im.save(out,format='PNG'); return out.getvalue()
 
+def preview_png(track_id, config, position):
+    z,w,h,style=settings(config)
+    visual=dict(drawing_settings(config),zoom=z,width=w,height=h,style=style,
+                fit_gaps=bool(config.get('fit_gaps',False)))
+    return _preview_png(track_id,position['lat'],position['lon'],
+                        json.dumps(visual,sort_keys=True),MAP_API_KEY)
+
+
+@lru_cache(maxsize=8)
+def _preview_png(track_id, lat, lon, visual_json, api_key):
+    return render(tracks[track_id]['points'],0,json.loads(visual_json),api_key,dict(lat=lat,lon=lon))
+
+
 def render_sequence(points, positions, config, api_key=_KEY_DEFAULT):
     """Keep one encoded frame; a fixed sequence has fixed route/style settings."""
     previous_coordinates, previous_png = None, None
@@ -437,7 +450,7 @@ class Handler(BaseHTTPRequestHandler):
                     offset=float(data['offset'])
                     if not math.isfinite(offset): raise ValueError('时间无效')
                     position=interpolate_position(track['points'],offset,fit_gaps=bool(data.get('fit_gaps',False)))
-                self.send(render(track['points'],index,data,position=position),content='image/png'); return
+                self.send(preview_png(data['id'],data,position or track['points'][index]),content='image/png'); return
             if self.path=='/api/export':
                 start,end=int(data.get('start',0)),int(data.get('end',len(track['points'])-1))
                 if not 0<=start<=end<len(track['points']): raise ValueError('导出范围无效')
