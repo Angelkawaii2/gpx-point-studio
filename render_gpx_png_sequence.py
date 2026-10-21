@@ -11,6 +11,7 @@ from io import BytesIO
 import json
 import math
 import hashlib
+import gzip
 import re
 from statistics import median
 import os
@@ -24,6 +25,7 @@ import zipfile
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode, parse_qs
+from map_labels import label_options, draw_labels
 
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / '.tile-cache'
@@ -34,7 +36,9 @@ tracks, jobs = {}, {}
 ENV_FILE = ROOT / '.env'
 config_lock = threading.Lock()
 cache_lock = threading.Lock()
-tile_locks = [threading.Lock() for _ in range(64)]
+tile_locks = [threading.RLock() for _ in range(64)]
+vector_locks = [threading.Lock() for _ in range(32)]
+label_locks = [threading.Lock() for _ in range(32)]
 cache_counters = dict(disk_hits=0, downloads=0, errors=0, active=0, last_error='')
 _inventory = dict(time=0, files=0, bytes=0, by_style={})
 _KEY_DEFAULT = object()
@@ -162,19 +166,20 @@ def cache_status():
     with cache_lock:
         if time.monotonic() - _inventory['time'] > 3:
             files, size, by_style = 0, 0, {}
-            for path in (CACHE / 'v2').glob('*/*/*/*/*.png'):
+            paths=list((CACHE/'v2').glob('*/*/*/*/*.png'))+list((CACHE/'labels-v2').glob('*/*/*/*/*/*.png'))+list((CACHE/'vector-v1').glob('*/*/*/*.mvt'))
+            for path in paths:
                 try:
                     amount = path.stat().st_size
                 except FileNotFoundError:
                     continue
-                style = path.relative_to(CACHE / 'v2').parts[0]
+                style = path.relative_to(CACHE).parts[1] if path.parts[len(CACHE.parts)]!='vector-v1' else 'vector'
                 entry = by_style.setdefault(style, dict(files=0, bytes=0))
                 entry['files'] += 1; entry['bytes'] += amount
                 files += 1; size += amount
             _inventory.update(time=time.monotonic(), files=files, bytes=size, by_style=by_style)
         info = _cached_tile.cache_info()
         return dict(**cache_counters, files=_inventory['files'], bytes=_inventory['bytes'],
-                    by_style=_inventory['by_style'], memory_hits=info.hits,
+                    by_style=_inventory['by_style'], memory_hits=info.hits+labelled_map_tile.cache_info().hits+vector_features.cache_info().hits,
                     memory_tiles=info.currsize, key_configured=bool(MAP_API_KEY))
 
 
@@ -253,6 +258,81 @@ def _cached_tile(cache_dir, style, scope, z, x, y, api_key):
         with cache_lock: cache_counters['active'] -= 1
 
 
+@lru_cache(maxsize=128)
+def vector_features(cache_dir, scope, z, x, y, api_key):
+    import mapbox_vector_tile
+    path=Path(cache_dir)/'vector-v1'/scope/str(z)/str(x)/f'{y}.mvt'
+    if path.exists():
+        data=path.read_bytes()
+        with cache_lock:cache_counters['disk_hits']+=1
+    else:
+        url=f'https://tiles-a.basemaps.cartocdn.com/vectortiles/carto.streets/v1/{z}/{x}/{y}.mvt?'+urlencode({'key':api_key})
+        with cache_lock:cache_counters['active']+=1
+        try:
+            for attempt in range(3):
+                try:
+                    with urlopen(Request(url,headers={'User-Agent':'GPXPointStudio/1.0'}),timeout=25) as response:data=response.read()
+                    if data[:2]==b'\x1f\x8b':data=gzip.decompress(data)
+                    decoded=mapbox_vector_tile.decode(data,default_options={'y_coord_down':True})
+                    path.parent.mkdir(parents=True,exist_ok=True)
+                    temp=path.with_suffix('.'+uuid.uuid4().hex+'.tmp')
+                    try:temp.write_bytes(data);temp.replace(path)
+                    finally:temp.unlink(missing_ok=True)
+                    with cache_lock:
+                        cache_counters['downloads']+=1;_inventory['time']=0
+                    return decoded
+                except Exception:
+                    if attempt<2:time.sleep(attempt+1)
+            raise RuntimeError('街道 / POI 矢量数据加载失败，请检查网络和 CARTO key') from None
+        except RuntimeError as exc:
+            with cache_lock:
+                cache_counters['errors']+=1;cache_counters['last_error']=str(exc)
+            raise
+        finally:
+            with cache_lock:cache_counters['active']-=1
+    if data[:2]==b'\x1f\x8b':data=gzip.decompress(data)
+    return mapbox_vector_tile.decode(data,default_options={'y_coord_down':True})
+
+
+def map_tile(style,z,x,y,config,api_key=_KEY_DEFAULT):
+    api_key=MAP_API_KEY if api_key is _KEY_DEFAULT else api_key
+    if style not in ('dark','light'):return tile(style,z,x,y,api_key)
+    if not config.get('map_labels',True):return tile(style+'-nolabels',z,x,y,api_key)
+    options=label_options(config)
+    if not any(options[name] for name in ('show_streets','show_places','show_pois')):
+        return tile(style+'-nolabels',z,x,y,api_key)
+    if not 0<=y<2**z:return tile(style,z,x,y,api_key)
+    identity=(str(CACHE),style,z,x%(2**z),y,json.dumps(options,sort_keys=True),api_key)
+    with label_locks[hash(identity)%len(label_locks)]:
+        return labelled_map_tile(*identity)
+
+
+@lru_cache(maxsize=128)
+def labelled_map_tile(cache_dir,style,z,x,y,options_json,api_key):
+    from PIL import Image
+    options=json.loads(options_json)
+    fingerprint=hashlib.sha256(options_json.encode()).hexdigest()[:16]
+    scope=cache_scope(style,api_key)
+    path=Path(cache_dir)/'labels-v2'/style/scope/fingerprint/str(z)/str(x)/f'{y}.png'
+    if path.exists():
+        with Image.open(path) as im:result=im.convert('RGB')
+        with cache_lock:cache_counters['disk_hits']+=1
+        return result
+    base=tile(style+'-nolabels',z,x,y,api_key)
+    source_z=min(14,z);factor=2**max(0,z-14)
+    # A parent MVT can serve many zoomed-in raster tiles and all languages.
+    vector_identity=(cache_dir,scope,source_z,x//factor,y//factor,api_key)
+    with vector_locks[hash(vector_identity)%len(vector_locks)]:
+        layers=vector_features(*vector_identity)
+    result=draw_labels(base,layers,z,x,y,dict(options,_dark=style=='dark'))
+    path.parent.mkdir(parents=True,exist_ok=True)
+    temp=path.with_suffix('.'+uuid.uuid4().hex+'.tmp')
+    try:result.save(temp,format='PNG');temp.replace(path)
+    finally:temp.unlink(missing_ok=True)
+    with cache_lock:_inventory['time']=0
+    return result
+
+
 def drawing_settings(value):
     result = {}
     for name, default, low, high in [('line_width',4,0,100), ('point_diameter',18,0,200), ('point_outline_width',3,0,30)]:
@@ -275,6 +355,7 @@ def settings(value):
     if not 1 <= z <= 19 or not 128 <= w <= 4096 or not 128 <= h <= 4096 or style not in STYLES:
         raise ValueError('缩放等级须为 1–19，宽高须为 128–4096，地图样式无效')
     drawing_settings(value)
+    label_options(value)
     return z,w,h,style
 
 def interpolate_position(points, offset, offsets=None, fit_gaps=False):
@@ -318,7 +399,6 @@ def frame_offset(plan, first_offset, frame):
 def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
     from PIL import Image, ImageDraw
     z,w,h,style = settings(config)
-    style = map_style(style,bool(config.get('map_labels',True)))
     paint = drawing_settings(config)
     position = position or points[index]
     cx,cy = project(position['lat'],position['lon'],z)
@@ -326,7 +406,7 @@ def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
     im = Image.new('RGB',(w,h))
     for ty in range(top//256,(top+h-1)//256+1):
         for tx in range(left//256,(left+w-1)//256+1):
-            im.paste(tile(style,z,tx,ty,api_key),(tx*256-left,ty*256-top))
+            im.paste(map_tile(style,z,tx,ty,config,api_key),(tx*256-left,ty*256-top))
     draw = ImageDraw.Draw(im)
     coords = []
     previous = None
@@ -352,7 +432,7 @@ def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
 
 def preview_png(track_id, config, position):
     z,w,h,style=settings(config)
-    visual=dict(drawing_settings(config),map_labels=bool(config.get('map_labels',True)),zoom=z,width=w,height=h,style=style,
+    visual=dict(drawing_settings(config),**label_options(config),map_labels=bool(config.get('map_labels',True)),zoom=z,width=w,height=h,style=style,
                 fit_gaps=bool(config.get('fit_gaps',False)))
     return _preview_png(track_id,position['lat'],position['lon'],
                         json.dumps(visual,sort_keys=True),MAP_API_KEY)
@@ -416,10 +496,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send((ROOT/'web'/name).read_bytes(),content={'/':'text/html; charset=utf-8','/app.js':'text/javascript','/style.css':'text/css'}[path]); return
             parts=path.strip('/').split('/')
             if len(parts)==6 and parts[:2]==['api','tiles']:
-                style=map_style(parts[2],parse_qs(self.path.partition('?')[2]).get('labels',['1'])[0]!='0'); z,x,y=int(parts[3]),int(parts[4]),int(parts[5].removesuffix('.png'))
+                query=parse_qs(self.path.partition('?')[2]);style=parts[2];config=dict(map_labels=query.get('labels',['1'])[0]!='0',label_language=query.get('language',['local'])[0],show_streets=query.get('streets',['1'])[0]!='0',show_places=query.get('places',['1'])[0]!='0',show_pois=query.get('pois',['1'])[0]!='0');label_options(config); z,x,y=int(parts[3]),int(parts[4]),int(parts[5].removesuffix('.png'))
                 if style not in STYLES or not 1<=z<=19 or not 0<=y<2**z:
                     raise ValueError('地图瓦片参数无效')
-                image=BytesIO(); tile(style,z,x,y).save(image,format='PNG')
+                image=BytesIO(); map_tile(style,z,x,y,config).save(image,format='PNG')
                 self.send(image.getvalue(),content='image/png'); return
             if len(parts)==3 and parts[:2]==['api','jobs']:
                 job=jobs[parts[2]]

@@ -231,6 +231,24 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(threshold,2)
         self.assertEqual([(g['start'],g['end']) for g in gaps],[(2,4)])
 
+    def test_label_language_fallback_and_feature_categories(self):
+        from map_labels import label_name,label_options,draw_labels
+        properties={'name':'人民大道','name:en':"People's Avenue",'name:zh-Hant':'人民大道'}
+        self.assertEqual(label_name(properties,'en'),"People's Avenue")
+        self.assertEqual(label_name(properties,'ja'),'人民大道')
+        self.assertEqual(label_name(properties,'local'),'人民大道')
+        base=Image.new('RGB',(256,256),'#202020')
+        layers={'transportation_name':dict(extent=256,features=[dict(properties=properties,geometry=dict(type='LineString',coordinates=[[10,128],[246,128]]))]),
+                'poi':dict(extent=256,features=[dict(properties={'name':'商店','name:en':'Shop'},geometry=dict(type='Point',coordinates=[100,60]))])}
+        off=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_streets=False,show_places=False,show_pois=False)),_dark=True))
+        self.assertEqual(off.tobytes(),base.tobytes())
+        roads=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_places=False,show_pois=False,label_language='en')),_dark=True))
+        pois=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_places=False,show_streets=False,label_language='en')),_dark=True))
+        self.assertNotEqual(roads.tobytes(),base.tobytes())
+        self.assertNotEqual(pois.tobytes(),base.tobytes())
+        self.assertNotEqual(roads.tobytes(),pois.tobytes())
+        with self.assertRaises(ValueError):label_options(dict(label_language='unknown-language'))
+
     def test_reject_invalid_coordinates(self):
         with self.assertRaises(ValueError):
             renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="nan" lon="2"/></trkseg></trk></gpx>')

@@ -29,7 +29,7 @@ cp .env.example .env
 - “设为左边界 / 设为右边界”将对应边界精确设置到当前蓝色游标（支持两个原始点之间的时间）。左拉杆为绿色左侧圆角，右拉杆为棕色右侧圆角，便于区分。选中范围播放和导出保留精确边界。
 - 时间轴首尾控制裁剪范围，蓝色游标控制当前点；左右箭头逐点移动。
 - 时间轴支持 1–32 倍缩放：使用加减按钮或滚轮，以鼠标位置为中心缩放；使用水平滚动条、触控板或 Shift + 滚轮平移。“显示完整时间轴”恢复全览。聚焦时间轴后可用 `+`、`-`、`0` 操作。
-- Dark / Light 支持“显示地点和街道名称”开关，默认开启；同步应用于全览、PNG 预览和导出。有名称和无名称瓦片分别缓存，默认 OSM 底图保持名称显示。
+- Dark / Light 使用无标注底图叠加 CARTO/OpenMapTiles 矢量标注；街道名称、地名/地区、POI 名称（商店、景点、车站等）可分别开关，默认均开启。可选当地原名、简体/繁体中文、英语、日语、韩语、德语、法语、西班牙语、俄语；缺少翻译时回退原名，密度随缩放等级变化。同步应用于全览、PNG 预览和导出。有名称和无名称瓦片分别缓存，默认 OSM 底图保持名称显示。
 - 选择默认 OSM、CARTO Dark 或 Light 样式；支持地图缩放等级 1–19、宽高各 128–4096 像素。PNG 预览与导出共用同一后端渲染器。
 - 时间轴用橙色标出记录空白：阈值为同段正采样间隔中位数的两倍（无固定秒数下限）；间隔达到阈值或轨迹段断开时标记为空白。开启拟合后空白区改为蓝色。点击时间轴空白处可将蓝色游标移动到该时间，拖动拉杆不会触发点击跳转。左右边界按钮位于播放控制区，以竖线分隔。导出设置中的“拟合轨迹”默认关闭，空白期间停留于前一点并断开轨迹线；开启后按时间线性补齐空白（包括段间空白），同步影响地图播放、PNG 预览和导出。空白时长仍保留。
 - 线条显示开关、颜色和粗细，以及当前位置圆点的显示开关、直径、填充色、描边颜色和粗细可直接配置，同步应用于地图、PNG 预览和导出。
@@ -93,7 +93,7 @@ The sidebar has Track Style, Map Settings and Export Settings tabs; switching ta
 - “设为左边界 / 设为右边界” set the corresponding trim boundary to the exact blue playhead time, including times between recorded points. The left handle is green with rounded left corners; the right handle is brown with rounded right corners. Playback and selected-range exports preserve exact boundaries.
 - Trim with the timeline's start/end handles and seek with the blue playhead. Arrow buttons step through original points.
 - Zoom the timeline from 1× to 32× using its buttons or the mouse wheel. Wheel zoom anchors at the pointer. Pan with the horizontal scrollbar, a trackpad, or Shift + wheel. Reset with “显示完整时间轴”. When the timeline is focused, `+`, `-`, and `0` provide keyboard controls.
-- Dark / Light offer a “显示地点和街道名称” toggle, enabled by default, shared by the overview, PNG preview and export. Labelled and unlabelled tiles have separate caches. The default OSM layer always shows labels.
+- Dark / Light overlay configurable CARTO/OpenMapTiles vector labels on an unlabelled raster base. Streets, place names and POIs (shops, attractions, stations, etc.) can be enabled independently, all on by default. Choose local names, Simplified/Traditional Chinese, English, Japanese, Korean, German, French, Spanish or Russian. Missing translations fall back to original names, and label density depends on zoom. The overview, PNG preview and export share these settings. Labelled and unlabelled tiles have separate caches. The default OSM layer always shows labels.
 - Choose OpenStreetMap, CARTO Dark, or CARTO Light; configure map zoom 1–19 and output width/height of 128–4096 pixels. Preview and export use the same backend renderer.
 - Recording gaps are highlighted in orange on the timeline. The threshold is twice the median positive in-segment sampling interval, without a fixed minimum. Intervals meeting that threshold and recording-segment breaks are gaps. Fitted gaps turn blue. Click timeline empty space to seek the blue playhead; dragging handles does not trigger seeking. Boundary buttons sit beside playback controls with vertical separators. “拟合轨迹” is off by default: position holds at the earlier point and the route line breaks during gaps. Enable it to linearly interpolate missing positions by time, including segment gaps, consistently in map playback, PNG preview and export. Gaps still count toward duration.
 - Configure line visibility, width and color, plus current-point visibility, diameter, fill color, outline width and color. The overview, PNG preview and export share these settings.
@@ -123,3 +123,9 @@ The output directory must be empty. The CLI accepts GPX only; FPS, speed, interp
 ```
 
 Leaflet and map tiles require internet access. PNGs include map attribution. Tiles are cached under `.tile-cache/v2/`; ZIPs remain under `.exports/`. These folders can be deleted after stopping the server. Tracks are held in local server memory and must be reimported after restart. One export runs at a time; tile failures are retried and reported.
+
+### 标注缓存 / Label cache
+
+矢量数据缓存于 `.tile-cache/vector-v1/`，自定义语言/分类合成后的瓦片缓存于 `.tile-cache/labels-v2/`，与既有底图缓存共同用于全览、PNG 预览和导出。语言和分类作为缓存键，切换语言不重复下载同一份矢量数据。中文等多语言字体在 macOS 自动查找 Hiragino/STHeiti；Linux 建议安装 Noto Sans CJK 字体，Windows 使用微软雅黑。
+
+Vector data lives under `.tile-cache/vector-v1/`; composed label tiles under `.tile-cache/labels-v2/`. Language and category settings partition composed tiles while reusing source vector data. On macOS CJK fonts are detected automatically; Linux should provide Noto Sans CJK, and Windows uses Microsoft YaHei.
