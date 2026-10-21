@@ -9,6 +9,192 @@ import render_gpx_png_sequence as renderer
 
 
 class RendererTests(unittest.TestCase):
+    def test_point_street_labels_do_not_use_line_length(self):
+        from map_labels import draw_labels,label_options
+        base=Image.new('RGB',(256,256),'#202020')
+        options=label_options(dict(show_places=False,show_pois=False))
+        for geometry in [dict(type='Point',coordinates=[128,128]),dict(type='MultiPoint',coordinates=[[128,128],[160,160]])]:
+            point=dict(properties=dict(name='Point street',rank=1),geometry=geometry)
+            def render(features):
+                return draw_labels(base,{'transportation_name':dict(extent=256,features=features)},14,0,0,options).tobytes()
+            expected=render([point])
+            self.assertNotEqual(expected,base.tobytes())
+            short=dict(properties=dict(name='Too long for segment',rank=0),geometry=dict(type='LineString',coordinates=[[1,1],[2,1]]))
+            self.assertEqual(render([short,point]),expected)
+
+    def test_export_defaults_and_cancellation_before_rendering(self):
+        import threading
+        self.assertEqual(renderer.settings({})[:3],(15,900,900))
+        paint=renderer.drawing_settings({})
+        self.assertEqual((paint['line_width'],paint['point_diameter'],paint['point_outline_width']),(10,40,6))
+        event=threading.Event();event.set()
+        state=dict(_cancel=event,workers=1,download_workers=1,done=0)
+        with self.assertRaises(renderer.ExportCancelled):
+            list(renderer.pipelined_frames([],[dict(lat=0,lon=0)],{},'test-key',state,sink=lambda *args:None))
+
+    def test_download_error_includes_status_but_redacts_secrets(self):
+        from urllib.error import HTTPError,URLError
+        error=HTTPError('https://example.com',429,'Too Many Requests',{},None)
+        self.assertIn('HTTP 429',renderer.download_error_details(error));error.close()
+        with patch.object(renderer,'MAP_API_KEY','secret-key'):
+            message=renderer.download_error_details(URLError('timeout https://example.com?key=secret-key&token=another-secret'))
+        self.assertIn('timeout',message)
+        self.assertNotIn('secret-key',message)
+        self.assertNotIn('another-secret',message)
+
+    def test_skip_failed_frames_preserves_original_numbering(self):
+        state=dict(workers=1,download_workers=1,done=0);written={}
+        def pool(**kwargs):
+            kwargs.pop('mp_context',None);return ThreadPoolExecutor(**kwargs)
+        def download(style,z,x,y,config,key):
+            if x==1:raise RuntimeError('network unreachable')
+        def sink(indices,png):
+            for i in indices:written[i]=png
+            state['_skip'].set()
+        with patch.object(renderer,'viewport_tiles',side_effect=lambda p,c:{(p['lon'],0)}),patch.object(renderer,'map_tile',side_effect=download),patch.object(renderer,'render_worker',return_value=b'png'),patch.object(renderer,'ProcessPoolExecutor',side_effect=pool),patch.object(renderer,'retry_delay',return_value=0):
+            list(renderer.pipelined_frames([],[dict(lat=0,lon=1),dict(lat=0,lon=2)],dict(style='default'),'test-key',state,sink=sink))
+        self.assertEqual(written,{2:b'png'})
+        self.assertEqual(state['skipped_frames'],[1])
+        self.assertEqual(state['done'],1)
+
+    def test_ten_failures_wait_for_manual_retry_without_losing_frames(self):
+        import threading,time
+        attempts={};written={};order=[];state=dict(workers=2,download_workers=2,done=0)
+        def download(style,z,x,y,config,key):
+            attempts[x]=attempts.get(x,0)+1
+            if x==1 and attempts[x]<=10:raise RuntimeError('offline')
+        def pool(**kwargs):
+            kwargs.pop('mp_context',None);return ThreadPoolExecutor(**kwargs)
+        def sink(indices,png):
+            order.extend(indices)
+            for index in indices:written[index]=png
+        errors=[]
+        def run():
+            try:list(renderer.pipelined_frames([],[dict(lat=0,lon=1),dict(lat=0,lon=2)],dict(style='default'),'test-key',state,sink=sink))
+            except Exception as exc:errors.append(exc)
+        with patch.object(renderer,'retry_delay',return_value=0),patch.object(renderer,'viewport_tiles',side_effect=lambda p,c:{(p['lon'],0)}),patch.object(renderer,'map_tile',side_effect=download),patch.object(renderer,'render_worker',side_effect=lambda p:str(p['lon']).encode()),patch.object(renderer,'ProcessPoolExecutor',side_effect=pool):
+            thread=threading.Thread(target=run);thread.start()
+            deadline=time.monotonic()+5
+            while state.get('phase')!='awaiting_retry' and time.monotonic()<deadline:time.sleep(.01)
+            self.assertEqual(state.get('phase'),'awaiting_retry')
+            self.assertEqual(attempts[1],10)
+            self.assertEqual(written,{2:b'2'})
+            self.assertEqual(state['done'],1)
+            state['_retry'].set();thread.join(5)
+            self.assertFalse(thread.is_alive())
+        self.assertFalse(errors)
+        self.assertEqual(written,{1:b'1',2:b'2'})
+        self.assertEqual(order,[2,1])
+
+    def test_render_retry_keeps_original_frame_numbers(self):
+        attempts={};written={};order=[]
+        positions=[dict(lat=0,lon=1),dict(lat=0,lon=2),dict(lat=0,lon=1)]
+        state=dict(workers=2,download_workers=2,done=0)
+        def draw(position):
+            key=position['lon'];attempts[key]=attempts.get(key,0)+1
+            if key==1 and attempts[key]==1:raise RuntimeError('render temporarily failed')
+            return str(key).encode()
+        def pool(**kwargs):
+            kwargs.pop('mp_context',None);return ThreadPoolExecutor(**kwargs)
+        def sink(indices,png):
+            order.extend(indices)
+            for index in indices:written[index]=png
+        with patch.object(renderer,'viewport_tiles',side_effect=lambda p,c:{(p['lon'],0)}),patch.object(renderer,'map_tile'),patch.object(renderer,'render_worker',side_effect=draw),patch.object(renderer,'ProcessPoolExecutor',side_effect=pool):
+            list(renderer.pipelined_frames([],positions,dict(style='default'),'test-key',state,sink=sink))
+        self.assertEqual(written,{1:b'1',2:b'2',3:b'1'})
+        self.assertEqual(order[0],2)
+        self.assertEqual(attempts[1],2)
+        self.assertEqual(state['done'],3)
+        self.assertTrue(any(entry['message']=='图片 {frame} 重试渲染成功' for entry in state['logs']))
+
+    def test_export_mode_requires_loopback_host_and_peer(self):
+        for host in ['localhost:8765','127.0.0.1:8765','127.0.0.2','[::1]:8765','app.localhost','0.0.0.0:8765']:
+            self.assertTrue(renderer.is_local_access(host,'127.0.0.1'),host)
+        for host,peer in [('example.com','127.0.0.1'),('localhost','192.168.1.2'),('localhost.evil.example','127.0.0.1'),('192.168.1.2','127.0.0.1')]:
+            self.assertFalse(renderer.is_local_access(host,peer))
+
+    def test_streaming_zip_uses_unseekable_http_writer(self):
+        import zipfile
+        output=BytesIO()
+        with zipfile.ZipFile(renderer.StreamingZipWriter(output),'w',allowZip64=True) as archive:
+            archive.writestr('frame_000001.png',b'png')
+        with zipfile.ZipFile(BytesIO(output.getvalue())) as archive:
+            self.assertEqual(archive.read('frame_000001.png'),b'png')
+
+    def test_clean_map_frames_and_separate_attribution_image(self):
+        config=dict(style='default',width=256,height=256,zoom=1,show_line=False,show_point=False)
+        with patch.object(renderer,'map_tile',return_value=Image.new('RGB',(256,256),'#123456')):
+            png=renderer.render([dict(lat=0,lon=0,segment=0)],0,config)
+        frame=Image.open(BytesIO(png))
+        self.assertEqual(frame.getpixel((6,250)),(18,52,86))
+        credit=Image.open(BytesIO(renderer.attribution_png(config)))
+        self.assertEqual(credit.size,frame.size)
+        self.assertGreater(len(credit.getcolors(100000)),1)
+
+    def test_export_log_retains_recent_structured_messages(self):
+        state={}
+        for i in range(505):renderer.export_log(state,'retry {count}',count=i)
+        self.assertEqual(len(state['logs']),500)
+        self.assertEqual(state['logs'][0]['values']['count'],5)
+        self.assertEqual(state['logs'][-1]['values']['count'],504)
+
+    def test_pipeline_renders_ready_frames_before_retrying_failed_tiles(self):
+        import threading
+        rendered=threading.Event();attempts={}
+        positions=[dict(lat=0,lon=1),dict(lat=0,lon=2),dict(lat=0,lon=2)]
+        state=dict(workers=2,download_workers=2,done=0)
+        def download(style,z,x,y,config,key):
+            attempts[x]=attempts.get(x,0)+1
+            if x==1 and attempts[x]==1:raise RuntimeError('temporary failure')
+            if x==1:self.assertTrue(rendered.wait(3))
+        def draw(position):
+            if position['lon']==2:rendered.set()
+            return b'png'
+        def pool(**kwargs):
+            kwargs.pop('mp_context',None)
+            return ThreadPoolExecutor(**kwargs)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(renderer,'viewport_tiles',side_effect=lambda p,c:{(p['lon'],0)}), patch.object(renderer,'map_tile',side_effect=download), patch.object(renderer,'render_worker',side_effect=draw), patch.object(renderer,'ProcessPoolExecutor',side_effect=pool):
+            paths=list(renderer.pipelined_frames([],positions,dict(style='default'),'test-key',state,Path(tmp)))
+            self.assertEqual([p.read_bytes() for p in paths],[b'png']*3)
+        self.assertEqual(state['done'],3)
+        self.assertEqual(state['rendered'],2)
+        self.assertEqual(state['reused'],1)
+        self.assertEqual(attempts[1],2)
+        self.assertEqual(state['tile_done'],2)
+        self.assertTrue(any(entry['message']=='瓦片 {z}/{x}/{y} 补充下载成功' for entry in state['logs']))
+
+    def test_clear_tile_cache_removes_disk_and_memory(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(renderer,'CACHE',Path(tmp)/'tiles'), patch.dict(renderer.jobs,{},clear=True), patch.dict(renderer.cache_counters,dict(active=0)):
+            renderer.CACHE.mkdir();(renderer.CACHE/'tile.png').write_bytes(b'cached')
+            renderer.clear_map_cache()
+            self.assertFalse(renderer.CACHE.exists())
+            self.assertEqual(renderer.labelled_map_tile.cache_info().currsize,0)
+            with patch.dict(renderer.jobs,{'busy':dict(status='running')}):
+                with self.assertRaises(ValueError):renderer.clear_map_cache()
+
+    def test_poi_tile_cache_isolates_all_label_parameters(self):
+        import json
+        with patch.object(renderer,'labelled_map_tile',return_value=None) as tile:
+            configs=[dict(poi_excluded=[]),dict(poi_excluded=['transit']),dict(poi_excluded=[],poi_font_size=20),dict(poi_excluded=[],show_pois=False),dict(poi_excluded=[],label_language='en')]
+            identities=[]
+            for config in configs:
+                renderer.map_tile('dark',14,1,1,({'show_pois':True} | config),'test-key')
+                identities.append(tile.call_args.args)
+            self.assertEqual(len(set(identities)),len(configs))
+            self.assertEqual(json.loads(identities[1][-2])['poi_excluded'],['transit'])
+            renderer.map_tile('dark',14,1,1,dict(poi_excluded=['parks','transit']),'test-key')
+            first=tile.call_args.args
+            renderer.map_tile('dark',14,1,1,dict(poi_excluded=['transit','parks']),'test-key')
+            self.assertEqual(first,tile.call_args.args)
+
+    def test_poi_preview_cache_isolates_categories(self):
+        renderer._preview_png.cache_clear()
+        with patch.dict(renderer.tracks,{'poi-cache-test':dict(points=[dict(lat=0,lon=0)])}):
+            with patch.object(renderer,'render',return_value=b'png') as draw:
+                for excluded in ([],['transit'],[]):
+                    renderer.preview_png('poi-cache-test',dict(poi_excluded=excluded),dict(lat=0,lon=0))
+                self.assertEqual(draw.call_count,2)
+
     def test_poi_filter_classification_and_rendering(self):
         from map_labels import poi_category,label_options,draw_labels,POI_CATEGORIES
         self.assertEqual(len(POI_CATEGORIES),32)
@@ -16,7 +202,7 @@ class RendererTests(unittest.TestCase):
             self.assertEqual(poi_category(props),expected)
         base=Image.new('RGB',(256,256),'#202020')
         layers={'poi':dict(extent=256,features=[dict(properties=dict(name='Bus stop',**{'class':'bus'}),geometry=dict(type='Point',coordinates=[128,128]))])}
-        visible=draw_labels(base,layers,14,0,0,label_options({}))
+        visible=draw_labels(base,layers,14,0,0,label_options(dict(show_pois=True)))
         hidden=draw_labels(base,layers,14,0,0,label_options(dict(poi_excluded=['transit'])))
         self.assertNotEqual(visible.tobytes(),base.tobytes())
         self.assertEqual(hidden.tobytes(),base.tobytes())
@@ -275,7 +461,7 @@ class RendererTests(unittest.TestCase):
         off=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_streets=False,show_places=False,show_pois=False)),_dark=True))
         self.assertEqual(off.tobytes(),base.tobytes())
         roads=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_places=False,show_pois=False,label_language='en')),_dark=True))
-        pois=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_places=False,show_streets=False,label_language='en',poi_excluded=[])),_dark=True))
+        pois=draw_labels(base,layers,14,0,0,dict(label_options(dict(show_places=False,show_streets=False,label_language='en',poi_excluded=[],show_pois=True)),_dark=True))
         self.assertNotEqual(roads.tobytes(),base.tobytes())
         self.assertNotEqual(pois.tobytes(),base.tobytes())
         self.assertNotEqual(roads.tobytes(),pois.tobytes())

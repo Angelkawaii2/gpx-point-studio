@@ -3,7 +3,13 @@
 from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 import multiprocessing
+import tempfile
+import ipaddress
+from contextlib import nullcontext
+import shutil
+from queue import Queue, Empty
 from bisect import bisect_right
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -26,7 +32,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from urllib.parse import urlencode, parse_qs
+from urllib.parse import urlencode, parse_qs, urlsplit
 from map_labels import label_options, draw_labels
 
 ROOT = Path(__file__).resolve().parent
@@ -35,6 +41,7 @@ STYLES = {'default': 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', 'dark': '
 for _style in ('dark','light'):
     STYLES[_style+'-nolabels'] = STYLES[_style].replace('_all/','_nolabels/')
 tracks, jobs = {}, {}
+download_context=threading.local()
 ENV_FILE = ROOT / '.env'
 config_lock = threading.Lock()
 cache_lock = threading.Lock()
@@ -224,6 +231,7 @@ def _cached_tile(cache_dir, style, scope, z, x, y, api_key):
     with cache_lock: cache_counters['active'] += 1
     try:
         for attempt in range(3):
+            if getattr(download_context,'cancel',None) and download_context.cancel.is_set():raise ExportCancelled()
             try:
                 with urlopen(Request(url, headers={'User-Agent':'GPXPointStudio/1.0 (local GPX PNG renderer)'}), timeout=25) as response:
                     data = response.read()
@@ -248,9 +256,9 @@ def _cached_tile(cache_dir, style, scope, z, x, y, api_key):
                     message = str(exc)
                     break
                 if isinstance(exc, HTTPError) and exc.code in (401,403):
-                    message = 'CARTO API key 未通过验证或访问受限（HTTP %s）' % exc.code
+                    message = 'CARTO: '+download_error_details(exc)
                     break
-                message = '地图瓦片请求失败，请检查网络或 API key'
+                message = download_error_details(exc)
                 if attempt < 2: time.sleep(attempt + 1)
         with cache_lock:
             cache_counters['errors'] += 1
@@ -272,6 +280,7 @@ def vector_features(cache_dir, scope, z, x, y, api_key):
         with cache_lock:cache_counters['active']+=1
         try:
             for attempt in range(3):
+                if getattr(download_context,'cancel',None) and download_context.cancel.is_set():raise ExportCancelled()
                 try:
                     with urlopen(Request(url,headers={'User-Agent':'GPXPointStudio/1.0'}),timeout=25) as response:data=response.read()
                     if data[:2]==b'\x1f\x8b':data=gzip.decompress(data)
@@ -283,9 +292,10 @@ def vector_features(cache_dir, scope, z, x, y, api_key):
                     with cache_lock:
                         cache_counters['downloads']+=1;_inventory['time']=0
                     return decoded
-                except Exception:
+                except Exception as exc:
+                    message=download_error_details(exc)
                     if attempt<2:time.sleep(attempt+1)
-            raise RuntimeError('街道 / POI 矢量数据加载失败，请检查网络和 CARTO key') from None
+            raise RuntimeError('Vector tile: '+message) from None
         except RuntimeError as exc:
             with cache_lock:
                 cache_counters['errors']+=1;cache_counters['last_error']=str(exc)
@@ -304,7 +314,7 @@ def map_tile(style,z,x,y,config,api_key=_KEY_DEFAULT):
     if not any(options[name] for name in ('show_streets','show_places','show_pois')):
         return tile(style+'-nolabels',z,x,y,api_key)
     if not 0<=y<2**z:return tile(style,z,x,y,api_key)
-    identity=(str(CACHE),style,z,x%(2**z),y,json.dumps(options,sort_keys=True),api_key)
+    identity=(str(CACHE),style,z,x%(2**z),y,json.dumps(dict(options,_label_version=4),sort_keys=True),api_key)
     with label_locks[hash(identity)%len(label_locks)]:
         return labelled_map_tile(*identity)
 
@@ -315,7 +325,7 @@ def labelled_map_tile(cache_dir,style,z,x,y,options_json,api_key):
     options=json.loads(options_json)
     fingerprint=hashlib.sha256(options_json.encode()).hexdigest()[:16]
     scope=cache_scope(style,api_key)
-    path=Path(cache_dir)/'labels-v2'/style/scope/fingerprint/str(z)/str(x)/f'{y}.png'
+    path=Path(cache_dir)/'labels-v4'/style/scope/fingerprint/str(z)/str(x)/f'{y}.png'
     if path.exists():
         with Image.open(path) as im:result=im.convert('RGB')
         with cache_lock:cache_counters['disk_hits']+=1
@@ -337,7 +347,7 @@ def labelled_map_tile(cache_dir,style,z,x,y,options_json,api_key):
 
 def drawing_settings(value):
     result = {}
-    for name, default, low, high in [('line_width',8,0,100), ('point_diameter',30,0,200), ('point_outline_width',3,0,30)]:
+    for name, default, low, high in [('line_width',10,0,100), ('point_diameter',40,0,200), ('point_outline_width',6,0,30)]:
         number = float(value.get(name, default))
         if not math.isfinite(number) or not low <= number <= high:
             raise ValueError(f'{name} 必须在 {low}–{high} 之间')
@@ -352,7 +362,7 @@ def drawing_settings(value):
     return result
 
 def settings(value):
-    z, w, h = int(value.get('zoom',14)), int(value.get('width',600)), int(value.get('height',600))
+    z, w, h = int(value.get('zoom',15)), int(value.get('width',900)), int(value.get('height',900))
     style = value.get('style','dark')
     if not 1 <= z <= 19 or not 128 <= w <= 4096 or not 128 <= h <= 4096 or style not in STYLES:
         raise ValueError('缩放等级须为 1–19，宽高须为 128–4096，地图样式无效')
@@ -473,11 +483,55 @@ def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
     if paint['show_point'] and diameter:
         r = diameter / 2
         draw.ellipse((x-r,y-r,x+r-1,y+r-1),fill=paint['point_color'],outline=paint['point_outline_color'],width=min(paint['point_outline_width'],max(1,diameter//2)))
-    credit = '© OpenStreetMap contributors' + (' © CARTO' if style != 'default' else '')
-    box = draw.textbbox((0,0),credit)
-    draw.rectangle((0,h-20,box[2]+12,h),fill='white')
-    draw.text((6,h-16),credit,fill='black')
     out=BytesIO(); im.save(out,format='PNG'); return out.getvalue()
+
+ATTRIBUTION_GUIDE_URL = 'https://osmfoundation.org/wiki/Attribution_Guidelines'
+ATTRIBUTION_GUIDE_TEXT = """OpenStreetMap attribution / 来源署名指引
+
+Official guideline / 官方指引:
+https://osmfoundation.org/wiki/Attribution_Guidelines
+
+Copyright and licence / 版权与许可:
+https://www.openstreetmap.org/copyright
+
+Quick guide / 简要说明:
+- Credit OpenStreetMap clearly and legibly, with the copyright URL.
+- For video where maps are not the focus, end credits or the description may be used.
+- If maps are a major component, typically also show credit in a map corner.
+- Hold the attribution card long enough to read; one video frame is not enough.
+- CARTO maps also credit CARTO: https://carto.com/attributions
+
+- 明确署名 OpenStreetMap，并包含版权链接，文字须清晰可读。
+- 地图不是视频重点时，可在片尾或视频说明中署名。
+- 地图是主要画面时，通常还应在地图角落显示署名。
+- 请将最后的署名图延长显示到足够阅读；单帧闪过不够。
+- 使用 CARTO 地图时，也保留 CARTO 署名与链接。
+
+This summary is not a replacement for the official guideline.
+本摘要不能代替官方指引。
+"""
+
+
+def attribution_png(config):
+    from PIL import Image, ImageDraw
+    from map_labels import font_for
+    _,w,h,style=settings(config)
+    dark=style.startswith('dark')
+    image=Image.new('RGB',(w,h),'#111820' if dark else '#f4f5f6')
+    draw=ImageDraw.Draw(image)
+    lines=['Map data','© OpenStreetMap contributors','openstreetmap.org/copyright']
+    if style!='default':lines+=['Map tiles © CARTO','carto.com/attributions']
+    size=max(6,min(40,w//18,h//14))
+    while size>6:
+        font=font_for('en',size)
+        if max(draw.textbbox((0,0),line,font=font)[2] for line in lines)<=w*.9:break
+        size-=1
+    font=font_for('en',size);spacing=round(size*1.7)
+    top=(h-spacing*len(lines))/2
+    for i,line in enumerate(lines):
+        draw.text((w/2,top+i*spacing),line,font=font,anchor='mt',fill='#e4edf5' if dark else '#263746')
+    out=BytesIO();image.save(out,format='PNG');return out.getvalue()
+
 
 def preview_png(track_id, config, position):
     z,w,h,style=settings(config)
@@ -519,7 +573,22 @@ def initialize_render_worker(points, config, api_key):
     worker_points,worker_config,worker_key=points,config,api_key
 
 
+def render_tile_path(style,z,x,y,config,api_key):
+    if style in ('dark','light') and config.get('map_labels',True):
+        options=label_options(config)
+        if any(options[name] for name in ('show_streets','show_places','show_pois')):
+            encoded=json.dumps(dict(options,_label_version=4),sort_keys=True)
+            fingerprint=hashlib.sha256(encoded.encode()).hexdigest()[:16]
+            return CACHE/'labels-v4'/style/cache_scope(style,api_key)/fingerprint/str(z)/str(x%(2**z))/f'{y}.png'
+        style+='-nolabels'
+    elif style in ('dark','light'):style+='-nolabels'
+    return CACHE/'v2'/style/cache_scope(style,api_key)/str(z)/str(x%(2**z))/f'{y}.png'
+
+
 def render_worker(position):
+    z,_,_,style=settings(worker_config)
+    if any(not render_tile_path(style,z,x,y,worker_config,worker_key).is_file() for x,y in viewport_tiles(position,worker_config)):
+        raise RuntimeError('Waiting for required map tiles')
     return render(worker_points,0,worker_config,worker_key,position)
 
 
@@ -544,7 +613,204 @@ def parallel_frames(points, positions, config, api_key, workers):
             future,reused=pending.popleft();yield future.result(),reused
 
 
-def export_job(job, track, config, start, end):
+def export_log(state,message,**values):
+    state['logs']=(state.get('logs',[])+[dict(time=time.time(),message=message,values=values)])[-500:]
+
+
+def clear_map_cache():
+    if any(job['status']=='running' for job in jobs.values()):
+        raise ValueError('导出期间不能清除缓存')
+    with cache_lock:
+        if cache_counters['active']:raise ValueError('瓦片请求进行中，请稍后清除缓存')
+        if CACHE.exists():shutil.rmtree(CACHE)
+        _cached_tile.cache_clear();labelled_map_tile.cache_clear();vector_features.cache_clear()
+        _preview_png.cache_clear()
+        _inventory.update(time=0,files=0,bytes=0,by_style={})
+        cache_counters.update(disk_hits=0,downloads=0,errors=0,active=0,last_error='')
+
+
+def download_error_details(exc):
+    if isinstance(exc,HTTPError):
+        message=f'HTTP {exc.code}: {exc.reason}'
+    else:
+        reason=getattr(exc,'reason',exc)
+        message=f'{type(reason).__name__}: {reason}'
+    if MAP_API_KEY:message=message.replace(MAP_API_KEY,'[redacted]')
+    return re.sub(r'([?&](?:key|api_key|token)=)[^&\s]+',r'\1[redacted]',message,flags=re.I)[:1200]
+
+
+class ExportCancelled(Exception):
+    pass
+
+
+def check_export_cancelled(state):
+    if state.get('_cancel') and state['_cancel'].is_set():raise ExportCancelled('Export stopped by user')
+
+
+def retry_delay(attempt):
+    return min(10,attempt)
+
+
+def pipelined_frames(points, positions, config, api_key, state, folder=None, sink=None):
+    """Render ready frames while downloads continue; retry failed tiles last."""
+    coordinates={};frame_keys=[];needs={};waiting={};frame_indices={}
+    for position in positions:
+        check_export_cancelled(state)
+        key=(position['lat'],position['lon']);frame_indices.setdefault(key,[]).append(len(frame_keys)+1);frame_keys.append(key)
+        if key in coordinates:continue
+        coordinates[key]=position;required=viewport_tiles(position,config);needs[key]=required
+        for coordinate in required:waiting.setdefault(coordinate,set()).add(key)
+    from collections import Counter
+    occurrences=Counter(frame_keys)
+    state.update(tile_total=len(waiting),tile_done=0,tile_failed=0,retry_round=0,
+                 rendered=0,reused=0,phase='downloading_rendering',phase_started=time.monotonic())
+    events=Queue();recheck=Queue();stop_download=threading.Event();manual_retry=threading.Event();state['_retry']=manual_retry;state['_skip']=threading.Event();state['_retry_generation']=0;state['_download_busy']=True;z,_,_,style=settings(config)
+    def download():
+        remaining=set(waiting)
+        try:
+            with ThreadPoolExecutor(max_workers=state['download_workers']) as pool:
+                attempt=0;generation=0
+                while not stop_download.is_set():
+                    check_export_cancelled(state)
+                    if generation!=state['_retry_generation']:
+                        generation=state['_retry_generation'];attempt=0
+                    while not recheck.empty():remaining.update(recheck.get())
+                    if not remaining or attempt>=10:
+                        state['_download_busy']=False;stop_download.wait(.2);continue
+                    state['_download_busy']=True
+                    attempt+=1
+                    state['retry_round']=attempt-1
+                    if attempt>1:
+                        state['phase']='retrying_rendering'
+                        export_log(state,'重试第 {round} 轮：{count} 张瓦片',round=attempt-1,count=len(remaining))
+                    failed=set();iterator=iter(remaining)
+                    # Process each batch independently so failed requests do not stop later tiles.
+                    from itertools import islice
+                    while True:
+                        if stop_download.is_set():break
+                        check_export_cancelled(state)
+                        batch=list(islice(iterator,state['download_workers']*2))
+                        if not batch:break
+                        def preload(tile):
+                            download_context.cancel=state.get('_cancel')
+                            check_export_cancelled(state)
+                            if attempt>1:
+                                path=render_tile_path(style,z,*tile,config,api_key)
+                                try:
+                                    from PIL import Image
+                                    with Image.open(path) as image:image.verify()
+                                except (OSError,ValueError):
+                                    path.unlink(missing_ok=True)
+                                    labelled_map_tile.cache_clear();_cached_tile.cache_clear()
+                            return map_tile(style,z,*tile,config,api_key)
+                        futures={pool.submit(preload,tile):tile for tile in batch}
+                        for future in as_completed(futures):
+                            tile=futures[future]
+                            try:
+                                future.result();events.put(('ready',tile))
+                                if attempt>1:export_log(state,'瓦片 {z}/{x}/{y} 补充下载成功',z=z,x=tile[0],y=tile[1])
+                            except Exception as exc:
+                                failed.add(tile)
+                                export_log(state,'瓦片 {z}/{x}/{y} 下载失败：{error}',z=z,x=tile[0],y=tile[1],error=download_error_details(exc))
+                        state['tile_failed']=len(failed)
+                    remaining=failed
+                    if remaining:stop_download.wait(retry_delay(attempt))
+            events.put(('finished',set()))
+        except Exception as exc:events.put(('error',str(exc)))
+    downloader=threading.Thread(target=download,daemon=True);downloader.start()
+    ready=[key for key,required in needs.items() if not required];pending={};paths={};finished=False;failed=set();retry_at={};render_attempts={};ready_tiles=set();extra_pools=[];exhausted=set()
+    try:
+        with ProcessPoolExecutor(max_workers=state['workers'],mp_context=multiprocessing.get_context('spawn'),
+                initializer=initialize_render_worker,initargs=(points,config,api_key)) as pool:
+            while len(paths)<len(coordinates):
+                check_export_cancelled(state)
+                if state['_skip'].is_set():
+                    state['skipped_frames']=sorted(index for key,indices in frame_indices.items() if key not in paths for index in indices)
+                    export_log(state,'用户跳过 {count} 张失败图片，原编号保留',count=len(state['skipped_frames']))
+                    break
+                if manual_retry.is_set():
+                    manual_retry.clear();state['_retry_generation']+=1
+                    if state.get('tile_failed'):state['_download_busy']=True
+                    for key in exhausted:
+                        render_attempts[key]=0;retry_at[key]=time.monotonic()
+                    exhausted.clear();state['phase']='retrying_rendering'
+                    export_log(state,'用户重试：继续处理未完成的瓦片和图片')
+                if not pending and not ready and not retry_at and not state['_download_busy'] and events.empty():
+                    if state['phase']!='awaiting_retry':
+                        state['phase']='awaiting_retry'
+                        state['failed_frames']=len(frame_keys)-state['done']
+                        export_log(state,'自动重试已达 10 次，其余任务已完成，等待用户重试')
+                try:
+                    kind,value=events.get(timeout=.05)
+                    if kind=='error':raise RuntimeError(value)
+                    if kind=='finished':finished=True;failed=value
+                    if kind=='ready':
+                        if value in ready_tiles:continue
+                        ready_tiles.add(value);state['tile_done']=len(ready_tiles)
+                        for key in waiting[value]:
+                            needs[key].discard(value)
+                            if not needs[key]:ready.append(key)
+                except Empty:pass
+                for key,deadline in list(retry_at.items()):
+                    if time.monotonic()>=deadline:ready.append(key);del retry_at[key]
+                while ready and len(pending)<state['workers']*2:
+                    key=ready.pop()
+                    try:pending[pool.submit(render_worker,coordinates[key])]=key
+                    except BrokenProcessPool:
+                        ready.extend(pending.values());pending.clear();ready.append(key)
+                        pool.shutdown(wait=False,cancel_futures=True)
+                        pool=ProcessPoolExecutor(max_workers=state['workers'],mp_context=multiprocessing.get_context('spawn'),initializer=initialize_render_worker,initargs=(points,config,api_key))
+                        extra_pools.append(pool)
+                        export_log(state,'渲染进程已重启，继续重试')
+                for future in list(pending):
+                    if not future.done():continue
+                    key=pending.pop(future)
+                    try:png=future.result()
+                    except Exception as exc:
+                        export_log(state,'图片 {frame} 渲染错误：{error}',frame=frame_indices[key][0],error=download_error_details(exc))
+                        render_attempts[key]=render_attempts.get(key,0)+1
+                        if render_attempts[key]<10:retry_at[key]=time.monotonic()+retry_delay(render_attempts[key])
+                        else:exhausted.add(key)
+                        recheck.put(viewport_tiles(coordinates[key],config))
+                        export_log(state,'图片 {frame} 渲染失败，等待重试（第 {round} 次）',frame=frame_indices[key][0],round=render_attempts[key])
+                        continue
+                    if key in render_attempts:export_log(state,'图片 {frame} 重试渲染成功',frame=frame_indices[key][0])
+                    if sink is not None:
+                        sink(frame_indices[key],png);paths[key]=True
+                    else:
+                        path=folder/f'frame_{frame_indices[key][0]:06d}.png';path.write_bytes(png);paths[key]=path
+                    state['rendered']+=1
+                    state['done']+=occurrences[key]
+                    state['reused']=state['done']-state['rendered']
+            stop_download.set()
+        state['phase']='saving' if state.get('mode')=='local' else 'packing'
+        if sink is None:
+            for key in frame_keys:
+                if key in paths:yield paths[key]
+    finally:
+        stop_download.set();downloader.join(timeout=.5 if state.get('_cancel') and state['_cancel'].is_set() else None)
+        for pool in extra_pools:pool.shutdown(wait=True,cancel_futures=True)
+
+
+def is_local_access(host, peer):
+    try:
+        hostname=(urlsplit('//'+host).hostname or '').lower().rstrip('.')
+        address=ipaddress.ip_address(peer.split('%')[0])
+        if not (address.is_loopback or getattr(address,'ipv4_mapped',None) and address.ipv4_mapped.is_loopback):return False
+        if hostname=='localhost' or hostname.endswith('.localhost'):return True
+        target=ipaddress.ip_address(hostname.split('%')[0])
+        return target.is_loopback or target.is_unspecified or bool(getattr(target,'ipv4_mapped',None) and target.ipv4_mapped.is_loopback)
+    except ValueError:return False
+
+
+class StreamingZipWriter:
+    def __init__(self,output):self.output=output
+    def write(self,data):
+        self.output.write(data);self.output.flush();return len(data)
+    def flush(self):self.output.flush()
+
+
+def export_job(job, track, config, start, end, stream=None):
     try:
         api_key = MAP_API_KEY
         plan = export_plan(track,config,start,end)
@@ -557,38 +823,46 @@ def export_job(job, track, config, start, end):
                     fit_gaps=bool(config.get('fit_gaps',False))) for frame in range(plan['frame_count']))
         state=jobs[job]
         state.update(phase='preparing',tile_done=0,tile_total=0,workers=os.cpu_count() or 1)
-        needed=set()
-        for position in positions():needed.update(viewport_tiles(position,config))
-        download_workers=max(1,min(32,int(config.get('download_workers',8))))
-        state.update(phase='downloading',tile_total=len(needed),download_workers=download_workers)
-        z,_,_,style=settings(config)
-        def preload(coordinate):
-            map_tile(style,z,*coordinate,config,api_key)
-        with ThreadPoolExecutor(max_workers=download_workers) as pool:
-            # Bounded batches avoid queuing every tile at once.
-            iterator=iter(needed)
-            while True:
-                from itertools import islice
-                batch=list(islice(iterator,download_workers*2))
-                if not batch:break
-                for future in as_completed([pool.submit(preload,item) for item in batch]):
-                    future.result();state['tile_done']+=1
-        state.update(phase='rendering',phase_started=time.monotonic())
-        folder=ROOT/'.exports'; folder.mkdir(exist_ok=True)
-        path=folder/f'{job}.zip'
-        with zipfile.ZipFile(path,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as archive:
-            jobs[job].update(rendered=0,reused=0)
-            for frame,(png,reused) in enumerate(parallel_frames(points,positions(),config,api_key,state['workers'])):
-                archive.writestr(f'frame_{frame+1:06d}.png',png)
-                jobs[job]['reused' if reused else 'rendered'] += 1
-                jobs[job]['done']=frame+1
-            jobs[job]['phase']='packing'
-            archive.writestr('manifest.json',json.dumps(dict(settings=config,start=start,end=end,
-                timing=plan,rendering=dict(rendered=jobs[job]['rendered'],reused=jobs[job]['reused']),timed=track['timed'],sampling='fixed frame grid with original points assigned to nearest frames; conflicts keep the closest point',
+        state['download_workers']=max(1,min(32,int(config.get('download_workers',8))))
+        local=stream is None
+        output=None
+        if local:
+            output=ROOT/'.exports'/datetime.now().astimezone().strftime('%Y-%m-%d_%H-%M-%S_%f%z')
+            output.mkdir(parents=True,exist_ok=False)
+            state['output_path']=str(output)
+        context=nullcontext(None) if local else zipfile.ZipFile(StreamingZipWriter(stream),'w',compression=zipfile.ZIP_STORED,allowZip64=True)
+        with context as archive:
+            def write(name,data):
+                check_export_cancelled(state)
+                if local:(output/name).write_bytes(data.encode('utf-8') if isinstance(data,str) else data)
+                else:archive.writestr(name,data)
+            def sink(indices,png):
+                first=f'frame_{indices[0]:06d}.png'
+                write(first,png)
+                for index in indices[1:]:
+                    name=f'frame_{index:06d}.png'
+                    if local:
+                        try:os.link(output/first,output/name)
+                        except OSError:shutil.copyfile(output/first,output/name)
+                    else:write(name,png)
+            for _ in pipelined_frames(points,positions(),config,api_key,state,sink=sink):pass
+            credit_name=f"frame_{plan['frame_count']+1:06d}.png"
+            write(credit_name,attribution_png(config))
+            write('OSM_ATTRIBUTION.txt',ATTRIBUTION_GUIDE_TEXT)
+            write('manifest.json',json.dumps(dict(settings=config,start=start,end=end,
+                attribution=dict(file=credit_name,extra_frames=1,hold_seconds=3,guidelines_file='OSM_ATTRIBUTION.txt',guidelines_url=ATTRIBUTION_GUIDE_URL),skipped_frames=state.get('skipped_frames',[]),total_png_files=plan['frame_count']+1-len(state.get('skipped_frames',[])),timing=plan,rendering=dict(rendered=state['rendered'],reused=state['reused']),timed=track['timed'],sampling='fixed frame grid with original points assigned to nearest frames; conflicts keep the closest point',
                 point_frames=[dict(frame=frame+1,source_point=index) for frame,index in sorted(assignments.items())],
                 points=points[start:end+1]),ensure_ascii=False))
-        jobs[job].update(status='complete',phase='complete',path=str(path))
+        check_export_cancelled(state)
+        state.update(status='complete',phase='complete')
     except Exception as exc:
+        if isinstance(exc,ExportCancelled) or jobs[job].get('_cancel') and jobs[job]['_cancel'].is_set():
+            state=jobs[job];state.update(status='cancelled',phase='cancelled')
+            export_log(state,'导出已停止，已生成图片保留')
+            if state.get('output_path'):
+                (Path(state['output_path'])/'EXPORT_CANCELLED.json').write_text(json.dumps(dict(status='cancelled',completed_frames=state.get('done',0),planned_frames=state['total']),ensure_ascii=False),encoding='utf-8')
+            return
+        export_log(jobs[job],'导出失败：{error}',error=str(exc).replace(MAP_API_KEY,'[redacted]') if MAP_API_KEY else str(exc))
         jobs[job].update(status='error',error=str(exc))
 
 
@@ -608,9 +882,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send((ROOT/'web'/name).read_bytes(),content={'/':'text/html; charset=utf-8','/app.js':'text/javascript','/style.css':'text/css','/i18n.js':'text/javascript','/locales.json':'application/json; charset=utf-8'}[path]); return
             parts=path.strip('/').split('/')
             if len(parts)==6 and parts[:2]==['api','tiles']:
-                query=parse_qs(self.path.partition('?')[2]);style=parts[2];config=dict(map_labels=query.get('labels',['1'])[0]!='0',label_language=query.get('language',['local'])[0],show_streets=query.get('streets',['1'])[0]!='0',show_places=query.get('places',['1'])[0]!='0',show_pois=query.get('pois',['1'])[0]!='0');
+                query=parse_qs(self.path.partition('?')[2]);style=parts[2];config=dict(map_labels=query.get('labels',['1'])[0]!='0',label_language=query.get('language',['local'])[0],show_streets=query.get('streets',['1'])[0]!='0',show_places=query.get('places',['1'])[0]!='0',show_pois=query.get('pois',['0'])[0]!='0');
                 if 'poi_excluded' in query:config['poi_excluded']=json.loads(query['poi_excluded'][0])
-                config.update({name:query.get(name,['13'])[0] for name in ('street_font_size','place_font_size','poi_font_size')});label_options(config); z,x,y=int(parts[3]),int(parts[4]),int(parts[5].removesuffix('.png'))
+                config.update({name:query.get(name,['15' if name=='street_font_size' else '13'])[0] for name in ('street_font_size','place_font_size','poi_font_size')});label_options(config); z,x,y=int(parts[3]),int(parts[4]),int(parts[5].removesuffix('.png'))
                 if style not in STYLES or not 1<=z<=19 or not 0<=y<2**z:
                     raise ValueError('地图瓦片参数无效')
                 image=BytesIO(); map_tile(style,z,x,y,config).save(image,format='PNG')
@@ -618,16 +892,18 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==3 and parts[:2]==['api','jobs']:
                 job=jobs[parts[2]]
                 elapsed=time.monotonic()-job['started']
-                result={k:v for k,v in job.items() if k not in ('path','started')}
+                if job.get('mode')=='local' and not is_local_access(self.headers.get('Host',''),self.client_address[0]):raise ValueError('Local export only')
+                result={k:v for k,v in job.items() if k not in ('path','started') and not k.startswith('_')}
                 result.update(elapsed=elapsed,eta=((time.monotonic()-job.get('phase_started',job['started']))/job['done']*(job['total']-job['done'])) if job['done'] else None)
                 self.send(result); return
             if len(parts)==3 and parts[:2]==['api','download']:
                 job=jobs[parts[2]]
-                if job['status']!='complete': raise ValueError('导出尚未完成')
-                file=Path(job['path'])
-                self.send_response(200); self.send_header('Content-Type','application/zip'); self.send_header('Content-Disposition','attachment; filename="gpx-png-sequence.zip"'); self.send_header('Content-Length',str(file.stat().st_size)); self.end_headers()
-                with file.open('rb') as f:
-                    while chunk:=f.read(1024*1024): self.wfile.write(chunk)
+                with config_lock:
+                    if job.get('mode')!='stream' or '_request' not in job:raise ValueError('流式导出已开始或不可用，请重新导出')
+                    request=job.pop('_request');job.update(status='running',started=time.monotonic())
+                self.send_response(200);self.send_header('Content-Type','application/zip');self.send_header('Content-Disposition','attachment; filename="gpx-png-sequence.zip"');self.send_header('Cache-Control','no-store');self.send_header('Connection','close');self.end_headers()
+                self.close_connection=True
+                export_job(parts[2],*request,stream=self.wfile)
                 return
             self.send({'error':'Not found'},404)
         except (KeyError,ValueError,RuntimeError) as exc: self.send({'error':str(exc)},400)
@@ -639,6 +915,10 @@ class Handler(BaseHTTPRequestHandler):
                 track=parse_gpx(raw,self.headers.get('X-Browser-Time-Zone')); key=uuid.uuid4().hex; tracks[key]=track
                 self.send(dict(id=key,**track)); return
             data=json.loads(raw)
+            if self.path=='/api/cache/clear':
+                if self.headers.get('Content-Type','').split(';')[0]!='application/json' or self.headers.get('Origin') not in (None,'http://'+self.headers.get('Host','')):
+                    raise ValueError('仅允许从本机网页清除缓存')
+                clear_map_cache();self.send({'cleared':True});return
             if self.path == '/api/config':
                 if self.headers.get('Content-Type','').split(';')[0] != 'application/json':
                     raise ValueError('配置请求必须使用 JSON')
@@ -646,8 +926,20 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('仅允许从本机网页修改配置')
                 save_map_key(data['carto_api_key'])
                 self.send({'carto_key_configured': bool(MAP_API_KEY)}); return
+            if self.path=='/api/cancel-export':
+                if self.headers.get('Content-Type','').split(';')[0]!='application/json' or self.headers.get('Origin') not in (None,'http://'+self.headers.get('Host','')):raise ValueError('Invalid origin')
+                job=jobs[data['id']]
+                if job['status'] not in ('running','pending'):raise ValueError('任务已经结束')
+                job['_cancel'].set();job['phase']='cancelling'
+                if job['status']=='pending':job.update(status='cancelled',phase='cancelled');job.pop('_request',None)
+                self.send({'accepted':True});return
+            if self.path in ('/api/retry-export','/api/skip-export'):
+                if self.headers.get('Content-Type','').split(';')[0]!='application/json' or self.headers.get('Origin') not in (None,'http://'+self.headers.get('Host','')):raise ValueError('Invalid origin')
+                job=jobs[data['id']]
+                if job.get('phase')!='awaiting_retry':raise ValueError('任务当前无需手动重试')
+                job['_skip' if self.path=='/api/skip-export' else '_retry'].set();self.send({'accepted':True});return
             track=tracks[data['id']]; settings(data)
-            if self.path=='/api/preview':
+            if self.path in ('/api/preview','/api/render-single'):
                 index=int(data['index'])
                 if not 0<=index<len(track['points']): raise ValueError('点位超出范围')
                 position=None
@@ -655,22 +947,29 @@ class Handler(BaseHTTPRequestHandler):
                     offset=float(data['offset'])
                     if not math.isfinite(offset): raise ValueError('时间无效')
                     position=interpolate_position(track['points'],offset,fit_gaps=bool(data.get('fit_gaps',False)))
-                self.send(preview_png(data['id'],data,position or track['points'][index]),content='image/png'); return
+                png=preview_png(data['id'],data,position or track['points'][index])
+                if self.path=='/api/render-single' and is_local_access(self.headers.get('Host',''),self.client_address[0]):
+                    folder=ROOT/'.exports'/datetime.now().astimezone().strftime('%Y-%m-%d_%H-%M-%S_%f%z');folder.mkdir(parents=True,exist_ok=False)
+                    path=folder/'gpx-current.png';path.write_bytes(png)
+                    self.send(dict(mode='local',output_path=str(path)));return
+                self.send(png,content='image/png');return
             if self.path=='/api/export':
                 start,end=int(data.get('start',0)),int(data.get('end',len(track['points'])-1))
                 if not 0<=start<=end<len(track['points']): raise ValueError('导出范围无效')
                 if any(j['status']=='running' for j in jobs.values()): raise ValueError('已有导出任务正在运行')
                 plan=export_plan(track,data,start,end)
-                key=uuid.uuid4().hex; jobs[key]=dict(status='running',phase='preparing',done=0,total=plan['frame_count'],started=time.monotonic(),timing=plan)
-                threading.Thread(target=export_job,args=(key,track,data,start,end),daemon=True).start()
-                self.send(dict(id=key)); return
+                local=is_local_access(self.headers.get('Host',''),self.client_address[0])
+                key=uuid.uuid4().hex; jobs[key]=dict(_cancel=threading.Event(),mode='local' if local else 'stream',status='running' if local else 'pending',phase='preparing',done=0,total=plan['frame_count'],started=time.monotonic(),timing=plan)
+                if local:threading.Thread(target=export_job,args=(key,track,data,start,end),daemon=True).start()
+                else:jobs[key]['_request']=(track,data,start,end)
+                self.send(dict(id=key,mode='local' if local else 'stream')); return
             self.send({'error':'Not found'},404)
         except Exception as exc: self.send({'error':str(exc)},400)
 
 def main():
     parser=argparse.ArgumentParser(description='默认启动网页；指定 GPX 和输出目录则每个原始点输出一张 PNG。')
     parser.add_argument('gpx',type=Path,nargs='?'); parser.add_argument('output_dir',type=Path,nargs='?')
-    parser.add_argument('--zoom',type=int,default=14); parser.add_argument('--size',default='600x600')
+    parser.add_argument('--zoom',type=int,default=15); parser.add_argument('--size',default='900x900')
     parser.add_argument('--map-style',choices=STYLES,default='dark'); parser.add_argument('--port',type=int,default=8765)
     parser.add_argument('--no-browser',action='store_true')
     args=parser.parse_args()
@@ -683,6 +982,8 @@ def main():
             if any(args.output_dir.iterdir()): raise ValueError('输出目录必须为空')
             for i,(png,reused) in enumerate(render_sequence(track['points'],track['points'],config)):
                 (args.output_dir/f'frame_{i+1:06d}.png').write_bytes(png); print(f"{i+1}/{len(track['points'])}" + (' (reused)' if reused else ''))
+            (args.output_dir/f"frame_{len(track['points'])+1:06d}.png").write_bytes(attribution_png(config))
+            (args.output_dir/'OSM_ATTRIBUTION.txt').write_text(ATTRIBUTION_GUIDE_TEXT,encoding='utf-8')
         except Exception as exc: parser.exit(1,f'{exc}\n')
     else:
         server=ThreadingHTTPServer(('127.0.0.1',args.port),Handler)

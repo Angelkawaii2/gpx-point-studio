@@ -22,9 +22,9 @@ def label_options(config):
     if language not in LANGUAGES: raise ValueError('不支持的标注语言')
     excluded=config.get('poi_excluded',[name for name in POI_CATEGORIES if name not in ('transit','government','parks','attraction')])
     if not isinstance(excluded,list) or any(name not in POI_CATEGORIES for name in excluded):raise ValueError('Invalid POI categories')
-    sizes={name:max(6,min(48,int(config.get(name,13)))) for name in ('street_font_size','place_font_size','poi_font_size')}
+    sizes={name:max(6,min(48,int(config.get(name,15 if name=='street_font_size' else 13)))) for name in ('street_font_size','place_font_size','poi_font_size')}
     return dict(**sizes,poi_excluded=sorted(set(excluded)),label_language=language,show_streets=bool(config.get('show_streets',True)),
-                show_places=bool(config.get('show_places',True)),show_pois=bool(config.get('show_pois',True)))
+                show_places=bool(config.get('show_places',True)),show_pois=bool(config.get('show_pois',False)))
 
 
 def label_name(properties, language):
@@ -78,7 +78,7 @@ def draw_labels(base, layers, z, x, y, options):
                 if (z>=13 and kind_class in ('country','state','city','town')) or (z>=16 and kind_class=='suburb'):continue
             if not text or len(text)>100:continue
             geometry=feature.get('geometry',{});kind=geometry.get('type');points=geometry.get('coordinates',[])
-            angle=0
+            angle=0;length=None
             if kind=='Point': px,py=coords(points,extent)
             elif kind=='MultiPoint' and points:px,py=coords(points[0],extent)
             elif kind in ('LineString','MultiLineString'):
@@ -107,7 +107,7 @@ def draw_labels(base, layers, z, x, y, options):
             size=options[{'place':'place_font_size','transportation_name':'street_font_size','poi':'poi_font_size'}[layer_name]]
             font=font_for(options['label_language'],size)
             box=font.getbbox(text);w,h=box[2]-box[0],box[3]-box[1]
-            if layer_name=='transportation_name' and length<w*.65:continue
+            if layer_name=='transportation_name' and length is not None and length<w*.65:continue
             key=(layer_name,text) if layer_name!='transportation_name' else (text,round(px/80),round(py/60))
             if key in seen:continue
             canvas=Image.new('RGBA',(w+10,h+10));draw=ImageDraw.Draw(canvas)
