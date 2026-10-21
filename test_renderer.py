@@ -175,6 +175,19 @@ class RendererTests(unittest.TestCase):
         self.assertEqual(off.getpixel((190,120)),(255,255,255))
         self.assertEqual(on.getpixel((190,120)),(0,255,0))
 
+    def test_identical_consecutive_frames_render_only_once(self):
+        points=[dict(lat=1,lon=2),dict(lat=1,lon=2),dict(lat=3,lon=4),dict(lat=3,lon=4)]
+        with patch.object(renderer,'render',side_effect=[b'first-png',b'second-png']) as draw:
+            output=list(renderer.render_sequence(points,points,dict(line_width=8)))
+        self.assertEqual(draw.call_count,2)
+        self.assertEqual(output,[(b'first-png',False),(b'first-png',True),(b'second-png',False),(b'second-png',True)])
+
+    def test_stationary_interpolation_keeps_exact_coordinate(self):
+        points=[dict(lat=1.28,lon=103.85,offset=0,segment=0),dict(lat=1.28,lon=103.85,offset=100,segment=0)]
+        for offset in [0,1,50,99,100]:
+            p=renderer.interpolate_position(points,offset)
+            self.assertEqual((p['lat'],p['lon']),(1.28,103.85))
+
     def test_reject_invalid_coordinates(self):
         with self.assertRaises(ValueError):
             renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="nan" lon="2"/></trkseg></trk></gpx>')

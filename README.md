@@ -60,7 +60,7 @@ API_KEY_CARTO=
 .venv/bin/python -m unittest -v test_renderer
 ```
 
-需要联网加载 Leaflet 和地图瓦片，PNG 保留来源署名。有效瓦片位于 `.tile-cache/v2/`，按样式和 key 的摘要隔离；旧版缓存不再读取，避免复用缺少 key 时生成的水印瓦片。内存 LRU 和磁盘缓存共用，重复并发请求只下载一次。右侧缓存面板每两秒显示有效缓存张数、磁盘用量、内存/磁盘命中、下载数、活动请求和错误。ZIP 位于 `.exports/`，停止服务后可删除。轨迹仅保存在本机内存中，重启后须重新导入。一次只运行一个导出任务；瓦片失败会重试并报告错误。
+需要联网加载 Leaflet 和地图瓦片，PNG 保留来源署名。有效瓦片位于 `.tile-cache/v2/`，按样式和 key 的摘要隔离；旧版缓存不再读取，避免复用缺少 key 时生成的水印瓦片。上下两张地图共用同一套内存 LRU 和磁盘缓存（相同样式、key、缩放等级和瓦片坐标可直接命中），重复并发请求只下载一次。导出和 CLI 中连续帧坐标、画面设置相同时直接复用上一张已编码 PNG，仍输出每一帧文件以保留时长；进度和 manifest 显示实际渲染/复用帧数。右侧缓存面板每两秒显示有效缓存张数、磁盘用量、内存/磁盘命中、下载数、活动请求和错误。ZIP 位于 `.exports/`，停止服务后可删除。轨迹仅保存在本机内存中，重启后须重新导入。一次只运行一个导出任务；瓦片失败会重试并报告错误。
 
 ## English
 
@@ -96,7 +96,7 @@ The app opens <http://127.0.0.1:8765> automatically. Use `--port 9000` to change
 
 Copy the empty `.env.example` template to `.env` and set `API_KEY_CARTO`, or expand “地图 API key 设置” in the sidebar to save/clear a CARTO key. Updates are written atomically to a local `.env` with `0600` permissions and apply immediately. Existing keys are never returned to the browser. The backend proxies map tiles so the key stays out of browser tile URLs, export archives, and Git commits.
 
-At startup an inherited `API_KEY_CARTO` overrides `.env`. Saving through the UI updates the current process and `.env`. OpenStreetMap needs no key; CARTO Dark/Light require a configured key. The overview, PNG preview, and export share the same backend credentials. Each export freezes its starting key until completion. Saving does not validate the key with the provider. Caches are partitioned by style and a credential digest; legacy tiles are ignored to avoid reusing API-key watermark images. Memory and disk caches are shared, and concurrent requests for the same tile download only once. The sidebar reports valid cached tile counts, disk usage, memory/disk hits, downloads, active requests, and errors every two seconds.
+At startup an inherited `API_KEY_CARTO` overrides `.env`. Saving through the UI updates the current process and `.env`. OpenStreetMap needs no key; CARTO Dark/Light require a configured key. The overview, PNG preview, and export share the same backend credentials. Each export freezes its starting key until completion. Saving does not validate the key with the provider. Caches are partitioned by style and a credential digest; legacy tiles are ignored to avoid reusing API-key watermark images. The overview and PNG renderer share memory and disk caches for identical style, credentials, zoom and tile coordinates. Concurrent requests for the same tile download only once. Export and CLI reuse the previous encoded PNG for consecutive identical coordinates with fixed visual settings. Every sequence filename is still written to preserve duration. Progress and the manifest report rendered/reused frame counts. The sidebar reports valid cached tile counts, disk usage, memory/disk hits, downloads, active requests, and errors every two seconds.
 
 Git ignores local environment files, virtual environments, tile caches, generated exports, and local GPX/FIT files. Only the empty `.env.example` template is tracked.
 

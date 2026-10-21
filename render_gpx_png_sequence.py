@@ -282,6 +282,8 @@ def interpolate_position(points, offset, offsets=None, fit_gaps=False):
     gap = b['offset'] - a['offset']
     is_gap = b.get('gap_before',False) or a['segment']!=b['segment']
     ratio = (offset-a['offset'])/gap if gap>0 and (not is_gap or fit_gaps) else 0
+    if a['lat']==b['lat'] and a['lon']==b['lon']:
+        return dict(a,offset=offset)
     delta_lon = (b['lon']-a['lon']+180)%360-180
     return dict(a,lat=a['lat']+(b['lat']-a['lat'])*ratio,
                 lon=(a['lon']+delta_lon*ratio+180)%360-180,offset=offset)
@@ -337,6 +339,18 @@ def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
     draw.text((6,h-16),credit,fill='black')
     out=BytesIO(); im.save(out,format='PNG'); return out.getvalue()
 
+def render_sequence(points, positions, config, api_key=_KEY_DEFAULT):
+    """Keep one encoded frame; a fixed sequence has fixed route/style settings."""
+    previous_coordinates, previous_png = None, None
+    for position in positions:
+        coordinates = (position['lat'],position['lon'])
+        reused = previous_png is not None and coordinates == previous_coordinates
+        if not reused:
+            previous_png = render(points,0,config,api_key,position)
+            previous_coordinates = coordinates
+        yield previous_png,reused
+
+
 def export_job(job, track, config, start, end):
     try:
         api_key = MAP_API_KEY
@@ -346,14 +360,16 @@ def export_job(job, track, config, start, end):
         folder=ROOT/'.exports'; folder.mkdir(exist_ok=True)
         path=folder/f'{job}.zip'
         with zipfile.ZipFile(path,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as archive:
-            for frame in range(plan['frame_count']):
-                offset = frame_offset(plan, points[start]['offset'], frame)
-                position = interpolate_position(points, offset, offsets,fit_gaps=bool(config.get('fit_gaps',False)))
-                archive.writestr(f'frame_{frame+1:06d}.png',render(points,start,config,api_key,position))
+            jobs[job].update(rendered=0,reused=0)
+            positions = (interpolate_position(points,frame_offset(plan,points[start]['offset'],frame),offsets,
+                         fit_gaps=bool(config.get('fit_gaps',False))) for frame in range(plan['frame_count']))
+            for frame,(png,reused) in enumerate(render_sequence(points,positions,config,api_key)):
+                archive.writestr(f'frame_{frame+1:06d}.png',png)
+                jobs[job]['reused' if reused else 'rendered'] += 1
                 jobs[job]['done']=frame+1
             jobs[job]['phase']='packing'
             archive.writestr('manifest.json',json.dumps(dict(settings=config,start=start,end=end,
-                timing=plan,timed=track['timed'],sampling='uniform source-time interpolation including endpoints',
+                timing=plan,rendering=dict(rendered=jobs[job]['rendered'],reused=jobs[job]['reused']),timed=track['timed'],sampling='uniform source-time interpolation including endpoints',
                 points=points[start:end+1]),ensure_ascii=False))
         jobs[job].update(status='complete',phase='complete',path=str(path))
     except Exception as exc:
@@ -447,8 +463,8 @@ def main():
             track=parse_gpx(args.gpx.read_bytes())
             args.output_dir.mkdir(parents=True,exist_ok=True)
             if any(args.output_dir.iterdir()): raise ValueError('输出目录必须为空')
-            for i in range(len(track['points'])):
-                (args.output_dir/f'frame_{i+1:06d}.png').write_bytes(render(track['points'],i,config)); print(f"{i+1}/{len(track['points'])}")
+            for i,(png,reused) in enumerate(render_sequence(track['points'],track['points'],config)):
+                (args.output_dir/f'frame_{i+1:06d}.png').write_bytes(png); print(f"{i+1}/{len(track['points'])}" + (' (reused)' if reused else ''))
         except Exception as exc: parser.exit(1,f'{exc}\n')
     else:
         server=ThreadingHTTPServer(('127.0.0.1',args.port),Handler)
