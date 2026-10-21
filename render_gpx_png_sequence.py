@@ -2,6 +2,7 @@
 """GPX point-by-point PNG renderer and local web application."""
 from __future__ import annotations
 import argparse
+from bisect import bisect_right
 from datetime import datetime
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -242,11 +243,43 @@ def settings(value):
     drawing_settings(value)
     return z,w,h,style
 
-def render(points, index, config, api_key=_KEY_DEFAULT):
+def interpolate_position(points, offset, offsets=None):
+    offsets = offsets if offsets is not None else [p['offset'] for p in points]
+    offset = max(offsets[0], min(offsets[-1], float(offset)))
+    i = max(0, bisect_right(offsets, offset) - 1)
+    a = points[i]
+    if i == len(points)-1:
+        return dict(a)
+    b = points[i+1]
+    gap = b['offset'] - a['offset']
+    ratio = (offset-a['offset'])/gap if gap > 0 and a['segment']==b['segment'] else 0
+    delta_lon = (b['lon']-a['lon']+180)%360-180
+    return dict(a,lat=a['lat']+(b['lat']-a['lat'])*ratio,
+                lon=(a['lon']+delta_lon*ratio+180)%360-180,offset=offset)
+
+
+def export_plan(track, config, start, end):
+    speed = float(config.get('export_speed',10))
+    fps_value = float(config.get('fps',30))
+    if not math.isfinite(speed) or not 1<=speed<=100 or fps_value not in (25,30,50,60):
+        raise ValueError('导出倍率必须为 1–100，帧率须为 25、30、50、60')
+    duration = track['points'][end]['offset']-track['points'][start]['offset']
+    count = max(1,math.ceil(duration/speed*int(fps_value)))
+    return dict(export_speed=speed,fps=int(fps_value),source_duration=duration,
+                estimated_duration=duration/speed,frame_count=count,sequence_duration=count/int(fps_value))
+
+
+def frame_offset(plan, first_offset, frame):
+    count = plan['frame_count']
+    return first_offset + (plan['source_duration']*frame/(count-1) if count>1 else 0)
+
+
+def render(points, index, config, api_key=_KEY_DEFAULT, position=None):
     from PIL import Image, ImageDraw
     z,w,h,style = settings(config)
     paint = drawing_settings(config)
-    cx,cy = project(points[index]['lat'],points[index]['lon'],z)
+    position = position or points[index]
+    cx,cy = project(position['lat'],position['lon'],z)
     left,top = round(cx-w/2), round(cy-h/2)
     im = Image.new('RGB',(w,h))
     for ty in range(top//256,(top+h-1)//256+1):
@@ -278,16 +311,25 @@ def render(points, index, config, api_key=_KEY_DEFAULT):
 def export_job(job, track, config, start, end):
     try:
         api_key = MAP_API_KEY
+        plan = export_plan(track,config,start,end)
+        points = track['points']
+        offsets = [p['offset'] for p in points]
         folder=ROOT/'.exports'; folder.mkdir(exist_ok=True)
         path=folder/f'{job}.zip'
         with zipfile.ZipFile(path,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as archive:
-            for number,index in enumerate(range(start,end+1),1):
-                archive.writestr(f'frame_{number:06d}.png',render(track['points'],index,config,api_key))
-                jobs[job]['done']=number
-            archive.writestr('manifest.json',json.dumps(dict(settings=config,start=start,end=end,points=track['points'][start:end+1]),ensure_ascii=False))
-        jobs[job].update(status='complete',path=str(path))
+            for frame in range(plan['frame_count']):
+                offset = frame_offset(plan, points[start]['offset'], frame)
+                position = interpolate_position(points, offset, offsets)
+                archive.writestr(f'frame_{frame+1:06d}.png',render(points,start,config,api_key,position))
+                jobs[job]['done']=frame+1
+            jobs[job]['phase']='packing'
+            archive.writestr('manifest.json',json.dumps(dict(settings=config,start=start,end=end,
+                timing=plan,timed=track['timed'],sampling='uniform source-time interpolation including endpoints',
+                points=points[start:end+1]),ensure_ascii=False))
+        jobs[job].update(status='complete',phase='complete',path=str(path))
     except Exception as exc:
         jobs[job].update(status='error',error=str(exc))
+
 
 class Handler(BaseHTTPRequestHandler):
     def send(self,data,status=200,content='application/json'):
@@ -311,7 +353,11 @@ class Handler(BaseHTTPRequestHandler):
                 image=BytesIO(); tile(style,z,x,y).save(image,format='PNG')
                 self.send(image.getvalue(),content='image/png'); return
             if len(parts)==3 and parts[:2]==['api','jobs']:
-                job=jobs[parts[2]]; self.send({k:v for k,v in job.items() if k!='path'}); return
+                job=jobs[parts[2]]
+                elapsed=time.monotonic()-job['started']
+                result={k:v for k,v in job.items() if k not in ('path','started')}
+                result.update(elapsed=elapsed,eta=(elapsed/job['done']*(job['total']-job['done'])) if job['done'] else None)
+                self.send(result); return
             if len(parts)==3 and parts[:2]==['api','download']:
                 job=jobs[parts[2]]
                 if job['status']!='complete': raise ValueError('导出尚未完成')
@@ -341,12 +387,18 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=='/api/preview':
                 index=int(data['index'])
                 if not 0<=index<len(track['points']): raise ValueError('点位超出范围')
-                self.send(render(track['points'],index,data),content='image/png'); return
+                position=None
+                if 'offset' in data:
+                    offset=float(data['offset'])
+                    if not math.isfinite(offset): raise ValueError('时间无效')
+                    position=interpolate_position(track['points'],offset)
+                self.send(render(track['points'],index,data,position=position),content='image/png'); return
             if self.path=='/api/export':
                 start,end=int(data.get('start',0)),int(data.get('end',len(track['points'])-1))
                 if not 0<=start<=end<len(track['points']): raise ValueError('导出范围无效')
                 if any(j['status']=='running' for j in jobs.values()): raise ValueError('已有导出任务正在运行')
-                key=uuid.uuid4().hex; jobs[key]=dict(status='running',done=0,total=end-start+1)
+                plan=export_plan(track,data,start,end)
+                key=uuid.uuid4().hex; jobs[key]=dict(status='running',phase='rendering',done=0,total=plan['frame_count'],started=time.monotonic(),timing=plan)
                 threading.Thread(target=export_job,args=(key,track,data,start,end),daemon=True).start()
                 self.send(dict(id=key)); return
             self.send({'error':'Not found'},404)

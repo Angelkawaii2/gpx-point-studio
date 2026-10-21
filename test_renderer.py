@@ -111,6 +111,30 @@ class RendererTests(unittest.TestCase):
             im=Image.open(BytesIO(renderer.render(points,0,dict(config,show_point=False,show_line=False))))
             self.assertEqual(im.getpixel((160,120)),(255,255,255))
 
+    def test_five_hours_at_5x_becomes_one_hour(self):
+        track=dict(points=[dict(offset=0),dict(offset=18000)])
+        plan=renderer.export_plan(track,dict(export_speed=5,fps=30),0,1)
+        self.assertEqual(plan['estimated_duration'],3600)
+        self.assertEqual(plan['frame_count'],108000)
+        self.assertEqual(plan['sequence_duration'],3600)
+        self.assertEqual(renderer.frame_offset(plan,0,107999),18000)
+
+    def test_interpolation_respects_recorded_time(self):
+        points=[dict(lat=0,lon=0,offset=0,segment=0),dict(lat=10,lon=20,offset=100,segment=0)]
+        position=renderer.interpolate_position(points,25)
+        self.assertEqual(position['lat'],2.5)
+        self.assertEqual(position['lon'],5)
+        points[1]['segment']=1
+        self.assertEqual(renderer.interpolate_position(points,25)['lat'],0)
+
+    def test_export_plan_rejects_invalid_rate(self):
+        track=dict(points=[dict(offset=0),dict(offset=10)])
+        for config in [dict(fps=24),dict(export_speed=0),dict(export_speed=101),dict(fps=30.5)]:
+            with self.assertRaises(ValueError):renderer.export_plan(track,config,0,1)
+        for fps in [25,30,50,60]:
+            plan=renderer.export_plan(track,dict(fps=fps,export_speed=5),0,1)
+            self.assertEqual(plan['frame_count'],2*fps)
+
     def test_reject_invalid_coordinates(self):
         with self.assertRaises(ValueError):
             renderer.parse_gpx(b'<gpx><trk><trkseg><trkpt lat="nan" lon="2"/></trkseg></trk></gpx>')
