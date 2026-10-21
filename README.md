@@ -21,6 +21,8 @@ cp .env.example .env
 
 ### 网页功能
 
+侧边栏按“轨迹样式 / 地图设置 / 导出设置”分为三个标签页；参数在切换时保留。地图名称开关仅对 Dark / Light 生效，并使用独立的有名称/无名称瓦片地址；默认 OSM 名称固定显示。
+
 - 点击导入或将一个 `.gpx` 文件拖到页面任意位置（不设文件大小上限）；自动显示全部轨迹点，支持多个轨迹段及路线点。
 - 点击轨迹点、点击地图选最近点，或拖动定位标记沿轨迹选点；原始坐标不会改变。
 - 时间轴起点、终点、当前时间及刻度下方显示录制当地时间：优先使用 GPX 时间戳记录的 UTC 偏移（`Z` 表示 UTC），没有偏移时使用浏览器时区。无时区时间戳也按浏览器时区解析。
@@ -82,6 +84,8 @@ cp .env.example .env
 The app opens <http://127.0.0.1:8765> automatically. Use `--port 9000` to change the port or `--no-browser` to suppress opening a browser. On Windows use `.venv\Scripts\python` and `.venv\Scripts\pip`. The server binds only to loopback.
 
 ### Web editor
+
+The sidebar has Track Style, Map Settings and Export Settings tabs; switching tabs preserves controls. Dark / Light labels use separate labelled/unlabelled tile URLs, and stale preview responses cannot override a newer label setting. The default OSM layer has fixed labels.
 
 - Import one `.gpx` file using the picker or drop it anywhere on the page (no application-defined file size limit). The map fits all points and preserves separate track segments and routes.
 - Select a point directly, click the map to select its nearest point, or drag the location marker along the track. Original coordinates remain unchanged.
