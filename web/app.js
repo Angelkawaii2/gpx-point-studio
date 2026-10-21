@@ -91,7 +91,7 @@ function drawGapBands(){const bands=$('gapBands');bands.replaceChildren();const 
 $('fitGaps').onchange=applyDrawing;
 
 function choosePlaybackSpeed(duration){const rates=[0.5,1,2,4,8,10,16,20,50,64,100,200,500,1000,2000];return rates.find(rate=>duration/rate<=600)??rates.at(-1)}
-function showPlaybackEstimate(mode){if(!track)return;const duration=sliderValue(end)-sliderValue(start),rate=+$('speed').value;$('playbackEstimate').textContent=`${mode} ${rate}× · 预计播放 ${formatDuration(duration/rate)}${duration/rate>600?'（已达最高倍率）':''}`}
+function showPlaybackEstimate(mode){if(!track)return;const duration=sliderValue(end)-sliderValue(start),rate=+$('speed').value;$('playbackEstimate').textContent=`${mode} ${rate}× · 预计播放 ${formatDuration(duration/rate)}${duration/rate>600&&rate===2000?'（已达最高倍率）':''}`}
 function autoPlaybackSpeed(){if(!track)return;$('speed').value=String(choosePlaybackSpeed(sliderValue(end)-sliderValue(start)));showPlaybackEstimate('自动选择')}
 $('speed').onchange=()=>showPlaybackEstimate('手动选择');
 
